@@ -9,15 +9,15 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 CREATE TABLE IF NOT EXISTS candles (
     id          BIGSERIAL PRIMARY KEY,
-    symbol      TEXT NOT NULL,
-    timeframe   TEXT NOT NULL,
+    symbol      VARCHAR(10) NOT NULL,
+    timeframe   VARCHAR(5) NOT NULL,
     ts          TIMESTAMPTZ NOT NULL,
-    open        NUMERIC NOT NULL,
-    high        NUMERIC NOT NULL,
-    low         NUMERIC NOT NULL,
-    close       NUMERIC NOT NULL,
-    volume      NUMERIC,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    open        NUMERIC(12,5) NOT NULL,
+    high        NUMERIC(12,5) NOT NULL,
+    low         NUMERIC(12,5) NOT NULL,
+    close       NUMERIC(12,5) NOT NULL,
+    volume      BIGINT,
+    is_anomaly  BOOLEAN NOT NULL DEFAULT FALSE,
     UNIQUE (symbol, timeframe, ts)
 );
 
@@ -26,11 +26,16 @@ CREATE INDEX IF NOT EXISTS idx_candles_symbol_timeframe_ts
 
 CREATE TABLE IF NOT EXISTS indicator_snapshots (
     id          BIGSERIAL PRIMARY KEY,
-    symbol      TEXT NOT NULL,
-    timeframe   TEXT NOT NULL,
+    symbol      VARCHAR(10) NOT NULL,
+    timeframe   VARCHAR(5) NOT NULL,
     ts          TIMESTAMPTZ NOT NULL,
-    indicators  JSONB NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ema20       NUMERIC(12,5),
+    ema50       NUMERIC(12,5),
+    rsi14       NUMERIC(6,3),
+    atr14       NUMERIC(12,5),
+    swing_high  NUMERIC(12,5),
+    swing_low   NUMERIC(12,5),
+    regime      VARCHAR(15),
     UNIQUE (symbol, timeframe, ts)
 );
 
@@ -73,14 +78,20 @@ CREATE INDEX IF NOT EXISTS idx_validator_log_symbol_ts ON validator_log (symbol,
 CREATE INDEX IF NOT EXISTS idx_validator_log_rule_name ON validator_log (rule_name);
 
 CREATE TABLE IF NOT EXISTS news_articles (
-    id          BIGSERIAL PRIMARY KEY,
-    ts          TIMESTAMPTZ NOT NULL,
-    source      TEXT NOT NULL,
-    headline    TEXT NOT NULL,
-    url         TEXT,
-    sentiment   NUMERIC,
-    raw         JSONB,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id            BIGSERIAL PRIMARY KEY,
+    url_hash      CHAR(16) UNIQUE NOT NULL,
+    url           TEXT,
+    source        TEXT,
+    title         TEXT,
+    summary       TEXT,
+    published_at  TIMESTAMPTZ,
+    fetched_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    relevance     SMALLINT,
+    direction     TEXT,
+    magnitude     SMALLINT,
+    confidence    SMALLINT,
+    thesis        TEXT,
+    tags          TEXT[]
 );
 
-CREATE INDEX IF NOT EXISTS idx_news_articles_ts ON news_articles (ts DESC);
+CREATE INDEX IF NOT EXISTS idx_news_articles_published_at ON news_articles (published_at DESC);
