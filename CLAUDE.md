@@ -18,6 +18,7 @@
 
 - config.py stage mechanism
 - this file
+- ai/price_resolver.py (anchor-enum contract; the AI/price wall)
 
 ## If the spec conflicts with reality
 

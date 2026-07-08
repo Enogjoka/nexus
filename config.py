@@ -57,6 +57,11 @@ CANDLE_LOOKBACK = {"1h": 500, "4h": 500, "1d": 400}
 TIMEFRAMES = ["1h", "4h", "1d"]
 ANOMALY_MAX_PCT_JUMP = {"1h": 3.0, "4h": 5.0, "1d": 8.0}
 
+# PRICE RESOLVER (XAUUSD anchor-enum contract)
+PIP_SIZE = 0.1  # XAUUSD: 1 pip = $0.10
+MAX_ENTRY_DRIFT_PCT = 0.5
+MIN_STOP_DISTANCE_PIPS = 15.0
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
