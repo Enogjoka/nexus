@@ -2,3 +2,7 @@ psycopg2-binary
 pytest
 pydantic>=2
 python-dotenv
+yfinance
+pandas
+ta
+numpy
