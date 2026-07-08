@@ -5,9 +5,12 @@ Both are ephemeral (in-memory only) — no persistence, no configuration.
 Thread-safety is provided by a lock guarding mutation/iteration, not by
 any framework magic.
 """
+import logging
 import threading
 from collections import defaultdict
 from typing import Any, Callable, DefaultDict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class AppState:
@@ -48,7 +51,27 @@ class EventBus:
             self._subscribers[event].append(callback)
 
     def publish(self, event: str, payload: Any = None) -> None:
+        """
+        Call every subscriber for `event`. A subscriber that raises is
+        logged and skipped — it never prevents other subscribers from
+        receiving the event, and never propagates back to the publisher
+        (INVARIANT 6: every external-ish call — a subscriber callback is
+        effectively arbitrary external code from the bus's point of view —
+        is guarded and its failure logged).
+        """
         with self._lock:
             callbacks = list(self._subscribers.get(event, []))
         for callback in callbacks:
-            callback(payload)
+            try:
+                callback(payload)
+            except Exception:
+                logger.exception("EventBus subscriber raised for event=%s; continuing", event)
+
+
+# Canonical process-wide instances. Modules should import and use these
+# directly (from core.state import BUS, STATE) rather than constructing
+# their own AppState()/EventBus() — AppState() already returns the same
+# singleton via __new__, but EventBus() does not, so BUS is the one bus
+# every publisher/subscriber in the process must share.
+STATE = AppState()
+BUS = EventBus()

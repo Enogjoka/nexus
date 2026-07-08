@@ -55,7 +55,7 @@ KILL_FILE_PATH = "./KILL"
 DATA_POLL_SECONDS = 300
 CANDLE_LOOKBACK = {"1h": 500, "4h": 500, "1d": 400}
 TIMEFRAMES = ["1h", "4h", "1d"]
-ANOMALY_MAX_PCT_JUMP = 3.0
+ANOMALY_MAX_PCT_JUMP = {"1h": 3.0, "4h": 5.0, "1d": 8.0}
 
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.

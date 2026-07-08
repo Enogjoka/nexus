@@ -24,22 +24,15 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import psycopg2
 import yfinance as yf
 from psycopg2.extras import execute_values
 from ta import momentum, trend, volatility
 
 import config
-from core.state import AppState, EventBus
+from core import database
+from core.state import BUS, STATE
 
 logger = logging.getLogger(__name__)
-
-# core/state.py's EventBus has no built-in process-wide singleton/registry
-# (unlike AppState). Since core/ is off-limits for this task, this module
-# owns its own bus instance and publishes "market_update" on it; a future
-# task will need to promote this to a shared instance if other modules
-# need to subscribe.
-EVENT_BUS = EventBus()
 
 # yfinance interval string per internal timeframe label (they happen to
 # match today, but keep the mapping explicit rather than relying on that).
@@ -107,14 +100,17 @@ def fetch_candles(symbol: str, interval: str, lookback: int) -> Optional[pd.Data
     return df
 
 
-def detect_anomalies(df: pd.DataFrame) -> pd.Series:
+def detect_anomalies(df: pd.DataFrame, timeframe: str = "1h") -> pd.Series:
     """
-    Boolean Series, True where the bar-to-bar close jump exceeds
-    config.ANOMALY_MAX_PCT_JUMP percent. The first bar is never flagged
-    (no prior bar to compare against).
+    Boolean Series, True where the bar-to-bar close jump exceeds the
+    per-timeframe threshold in config.ANOMALY_MAX_PCT_JUMP (percent). The
+    first bar is never flagged (no prior bar to compare against). A
+    timeframe missing from the config dict — or omitted entirely — falls
+    back to the tightest (1h) threshold rather than raising.
     """
+    threshold = config.ANOMALY_MAX_PCT_JUMP.get(timeframe, config.ANOMALY_MAX_PCT_JUMP["1h"])
     pct_jump = df["close"].pct_change().abs() * 100
-    return (pct_jump > config.ANOMALY_MAX_PCT_JUMP).fillna(False)
+    return (pct_jump > threshold).fillna(False)
 
 
 def compute_indicators(df: pd.DataFrame) -> Dict[str, Optional[float]]:
@@ -262,13 +258,6 @@ def fetch_dxy_trend() -> Optional[Dict[str, Any]]:
     return {"close": last_close, "trend": dxy_trend, "ts": df["ts"].iloc[-1].to_pydatetime()}
 
 
-def _connect():
-    """Open a fresh DB connection from config.DATABASE_URL. Raises if unset."""
-    if not config.DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set")
-    return psycopg2.connect(config.DATABASE_URL)
-
-
 def persist_candles(conn, symbol: str, timeframe: str, df: pd.DataFrame) -> int:
     """
     Upsert candles: ON CONFLICT (symbol, timeframe, ts) DO NOTHING. Bars
@@ -277,7 +266,7 @@ def persist_candles(conn, symbol: str, timeframe: str, df: pd.DataFrame) -> int:
     Returns the number of rows attempted (some may be skipped by the
     ON CONFLICT clause if already stored).
     """
-    anomaly_flags = detect_anomalies(df)
+    anomaly_flags = detect_anomalies(df, timeframe)
 
     rows = []
     for idx, row in df.iterrows():
@@ -358,68 +347,57 @@ def run_cycle() -> Dict[str, Any]:
     and skipped (state falls back to stale + a staleness timestamp) — it
     never aborts the rest of the cycle (INVARIANT 6).
     """
-    state = AppState()
     now = datetime.now(timezone.utc)
     session = detect_session(now)
 
     summary: Dict[str, Any] = {"generated_at": now, "session": session, "timeframes": {}, "dxy": None}
 
-    conn = None
-    try:
-        conn = _connect()
-    except Exception:
-        logger.exception("run_cycle: could not obtain a database connection; continuing without persistence")
+    for timeframe in config.TIMEFRAMES:
+        lookback = config.CANDLE_LOOKBACK.get(timeframe, 300)
+        df = fetch_candles(config.YF_SYMBOL, timeframe, lookback)
 
-    try:
-        for timeframe in config.TIMEFRAMES:
-            lookback = config.CANDLE_LOOKBACK.get(timeframe, 300)
-            df = fetch_candles(config.YF_SYMBOL, timeframe, lookback)
+        if df is None or df.empty:
+            logger.warning("run_cycle: no data for timeframe=%s; keeping stale state", timeframe)
+            stale = dict(STATE.get_market_data(timeframe) or {})
+            stale["stale"] = True
+            stale["stale_since"] = now.isoformat()
+            STATE.update_market_data(timeframe, stale)
+            summary["timeframes"][timeframe] = {"error": "fetch_failed", "stale_since": now.isoformat()}
+            continue
 
-            if df is None or df.empty:
-                logger.warning("run_cycle: no data for timeframe=%s; keeping stale state", timeframe)
-                stale = dict(state.get_market_data(timeframe) or {})
-                stale["stale"] = True
-                stale["stale_since"] = now.isoformat()
-                state.update_market_data(timeframe, stale)
-                summary["timeframes"][timeframe] = {"error": "fetch_failed", "stale_since": now.isoformat()}
-                continue
+        indicators = compute_indicators(df)
+        regime = compute_regime(df)
+        last_row = df.iloc[-1]
+        anomaly_flags = detect_anomalies(df, timeframe)
 
-            indicators = compute_indicators(df)
-            regime = compute_regime(df)
-            last_row = df.iloc[-1]
-            anomaly_flags = detect_anomalies(df)
+        try:
+            with database.get_conn() as conn:
+                persist_candles(conn, config.YF_SYMBOL, timeframe, df)
+                persist_indicator_snapshot(
+                    conn, config.YF_SYMBOL, timeframe, last_row["ts"].to_pydatetime(), indicators, regime
+                )
+        except Exception:
+            logger.exception("run_cycle: persistence failed for timeframe=%s", timeframe)
 
-            if conn is not None:
-                try:
-                    persist_candles(conn, config.YF_SYMBOL, timeframe, df)
-                    persist_indicator_snapshot(
-                        conn, config.YF_SYMBOL, timeframe, last_row["ts"].to_pydatetime(), indicators, regime
-                    )
-                except Exception:
-                    logger.exception("run_cycle: persistence failed for timeframe=%s", timeframe)
+        tf_state = {
+            "price": float(last_row["close"]),
+            "ts": last_row["ts"].to_pydatetime(),
+            "indicators": indicators,
+            "regime": regime,
+            "is_anomaly": bool(anomaly_flags.iloc[-1]),
+            "stale": False,
+        }
+        STATE.update_market_data(timeframe, tf_state)
+        summary["timeframes"][timeframe] = tf_state
 
-            tf_state = {
-                "price": float(last_row["close"]),
-                "ts": last_row["ts"].to_pydatetime(),
-                "indicators": indicators,
-                "regime": regime,
-                "is_anomaly": bool(anomaly_flags.iloc[-1]),
-                "stale": False,
-            }
-            state.update_market_data(timeframe, tf_state)
-            summary["timeframes"][timeframe] = tf_state
+    dxy = fetch_dxy_trend()
+    if dxy is not None:
+        STATE.update_market_data("dxy", dxy)
+    summary["dxy"] = dxy if dxy is not None else STATE.get_market_data("dxy")
 
-        dxy = fetch_dxy_trend()
-        if dxy is not None:
-            state.update_market_data("dxy", dxy)
-        summary["dxy"] = dxy if dxy is not None else state.get_market_data("dxy")
+    STATE.last_analysis_ts = now.timestamp()
 
-        state.last_analysis_ts = now.timestamp()
-    finally:
-        if conn is not None:
-            conn.close()
-
-    EVENT_BUS.publish("market_update", summary)
+    BUS.publish("market_update", summary)
     return summary
 
 

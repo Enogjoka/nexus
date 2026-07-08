@@ -8,7 +8,8 @@ knobs live in config.py; secrets live in the environment.
 """
 import glob
 import os
-from typing import Optional
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional, Sequence
 
 import psycopg2
 from psycopg2 import pool as pg_pool
@@ -95,3 +96,39 @@ def close() -> None:
     if _pool is not None:
         _pool.closeall()
         _pool = None
+
+
+@contextmanager
+def get_conn() -> Iterator[Any]:
+    """
+    Checkout a connection from the pool for the duration of the `with`
+    block. Commits on clean exit, rolls back on any exception (the
+    exception still propagates), and always returns the connection to the
+    pool. This is the one place callers outside this module should get a
+    connection from — do not call psycopg2.connect() directly elsewhere.
+    """
+    pool = _get_pool()
+    conn = pool.getconn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pool.putconn(conn)
+
+
+def execute(sql: str, params: Optional[Sequence[Any]] = None) -> None:
+    """Run a single statement (INSERT/UPDATE/DDL) via get_conn()."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+
+
+def fetch(sql: str, params: Optional[Sequence[Any]] = None) -> list:
+    """Run a SELECT via get_conn() and return all rows."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
