@@ -18,6 +18,7 @@ DATABASE_URL is unset. Every other test runs without a live Postgres — the
 validator persists its log best-effort and returns a Verdict regardless
 (INVARIANT 6), so the pure-logic assertions never depend on the DB.
 """
+import logging
 from datetime import datetime, timezone
 
 import pytest
@@ -381,6 +382,27 @@ def test_validator_log_writes_exactly_eight_rows():
         "RULE6_RR_FLOOR",
         "RULE7_CONFIDENCE_FLOOR",
     }
+
+
+def test_unrecognized_grade_collapses_to_b_and_logs(caplog):
+    symbol = "TST_GRADE"
+    with caplog.at_level(logging.WARNING):
+        v = validate(make_sig("LONG"), make_resolved(), "S+", 70, make_ctx(symbol=symbol))
+
+    assert v.grade == "B"  # collapsed to the worst grade
+    assert v.action == "PASS"  # sanity is a warning, not a block
+    assert "GRADE_UNRECOGNIZED:S+" in v.reasons
+    assert "unrecognized grade" in caplog.text  # logger.warning fired
+
+    if config.DATABASE_URL:
+        rows = database.fetch(
+            "SELECT rule_result, details FROM validator_log "
+            "WHERE symbol = %s AND rule_name = 'GRADE_SANITY'",
+            (symbol,),
+        )
+        assert len(rows) == 1
+        assert rows[0][0] == "WARN"
+        assert rows[0][1] == {"grade": "S+"}  # raw value carried in details JSONB
 
 
 def test_db_down_still_returns_verdict(monkeypatch):

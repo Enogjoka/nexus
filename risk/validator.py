@@ -168,6 +168,19 @@ def validate(
     initial_grade_idx = _grade_index(grade)
     initial_confidence_clamped = max(0.0, min(100.0, float(confidence)))
 
+    # ---- Grade sanity ------------------------------------------------------
+    # An unrecognized grade still collapses to the worst grade (B) — the
+    # conservative choice — but that collapse must never be silent. Warn, emit
+    # a GRADE_SANITY/WARN audit row, and surface it in the Verdict reasons.
+    # These are threaded into whichever write path runs below (NO_CLOCK early
+    # return or the full evaluation).
+    grade_sanity_rows: List[Tuple[str, str, dict]] = []
+    grade_sanity_reason: Optional[str] = None
+    if grade not in _GRADE_LADDER:
+        logger.warning("validator: unrecognized grade %r; collapsing to B", grade)
+        grade_sanity_reason = f"GRADE_UNRECOGNIZED:{grade}"
+        grade_sanity_rows.append(("GRADE_SANITY", _WARN, {"grade": grade}))
+
     # ---- Clock precondition -------------------------------------------------
     # Required. No default-to-now(): if the caller cannot tell us the time we
     # will not evaluate the fix window blind. Immediate WAIT.
@@ -175,8 +188,11 @@ def validate(
     if utc_now is None or not hasattr(utc_now, "hour"):
         reason = "RULE1 NO_CLOCK: ctx['utc_now'] missing/None; cannot clear fix window; WAIT"
         logger.warning("validator: %s", reason)
-        log_ok = _write_log(symbol, None, [("RULE1_EVENT_BLOCK", _NO_CLOCK, {"utc_now": utc_now})])
+        rows = grade_sanity_rows + [("RULE1_EVENT_BLOCK", _NO_CLOCK, {"utc_now": utc_now})]
+        log_ok = _write_log(symbol, None, rows)
         reasons = [reason]
+        if grade_sanity_reason:
+            reasons.append(grade_sanity_reason)
         if not log_ok:
             reasons.append("VALIDATOR_LOG_UNAVAILABLE")
         return Verdict(
@@ -191,8 +207,8 @@ def validate(
     conf = initial_confidence_clamped
     action = _PASS
     rules_fired: List[str] = []
-    reasons: List[str] = []
-    log_rows: List[Tuple[str, str, dict]] = []
+    reasons: List[str] = [grade_sanity_reason] if grade_sanity_reason else []
+    log_rows: List[Tuple[str, str, dict]] = list(grade_sanity_rows)
 
     def record(rule_name: str, result: str, details: dict) -> None:
         log_rows.append((rule_name, result, details))
