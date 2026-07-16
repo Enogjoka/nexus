@@ -35,6 +35,12 @@ def get_stage() -> Stage:
 ACCOUNT_SIZE = 5000
 MAX_RISK_PCT = 1.0
 
+# SIZING (risk/sizing.py)
+CONTRACT_SIZE_OZ = 100  # 1.0 lot XAUUSD = 100 oz
+LOT_STEP = 0.01
+MIN_LOT = 0.01
+MAX_LOT_HARD_CAP = 1.0  # absolute ceiling regardless of equity
+
 # MODELS
 CLAUDE_MODEL = "claude-fable-5"
 TRIAGE_MODEL = "claude-sonnet-4-6"
