@@ -19,6 +19,7 @@
 - config.py stage mechanism
 - this file
 - ai/price_resolver.py (anchor-enum contract; the AI/price wall)
+- risk/validator.py (7-rule pre-flight gate; only restricts, never loosens)
 
 ## If the spec conflicts with reality
 

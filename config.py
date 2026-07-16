@@ -62,6 +62,20 @@ PIP_SIZE = 0.1  # XAUUSD: 1 pip = $0.10
 MAX_ENTRY_DRIFT_PCT = 0.5
 MIN_STOP_DISTANCE_PIPS = 15.0
 
+# VALIDATOR (pre-flight gate — risk/validator.py)
+# RSI extremes are dual-timeframe and direction-aware: BOTH h1 and h4 must be
+# past their threshold before the rule fires (see risk/validator.py RULE 2).
+RSI_EXTREME_LONG = {"h1": 78, "h4": 70}
+RSI_EXTREME_SHORT = {"h1": 22, "h4": 30}
+EVENT_BLOCK_MINUTES = 30
+FIX_BLOCK_MINUTES = 20
+LONDON_FIX_UTC = ["10:30", "15:00"]
+RR_FLOOR_TP1 = 1.2
+RR_WARN_TP2 = 2.0
+CONFIDENCE_FLOOR = 40
+MACRO_DIVERGENCE_PENALTY = 8
+VOLATILE_PENALTY = 5
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
