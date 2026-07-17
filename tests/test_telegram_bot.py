@@ -176,3 +176,71 @@ def test_send_failure_logs_and_returns_false(monkeypatch, caplog):
 
     assert result is False
     assert "sendMessage failed" in caplog.text
+
+
+# --------------------------------------------------------------------------
+# the token must NEVER reach a log record
+# --------------------------------------------------------------------------
+
+_SECRET_TOKEN = "123456789:AAHsecretTOKENvalueXYZ"
+
+
+def _no_token_in_records(caplog):
+    """The raw token must appear in no log record (message OR formatted output)."""
+    for record in caplog.records:
+        assert _SECRET_TOKEN not in record.getMessage()
+    assert _SECRET_TOKEN not in caplog.text
+    assert "**TOKEN**" in caplog.text
+
+
+def test_api_post_error_redacts_token(monkeypatch, caplog):
+    _configure(monkeypatch, token=_SECRET_TOKEN, chats="111")
+    leaky_url = f"{config.TELEGRAM_API_BASE}/bot{_SECRET_TOKEN}/sendMessage"
+
+    def boom(url, json=None, timeout=None):
+        raise RuntimeError(f"Max retries exceeded with url: {leaky_url}")
+
+    monkeypatch.setattr(telegram_bot.requests, "post", boom)
+
+    with caplog.at_level(logging.ERROR):
+        assert telegram_bot._api_post("sendMessage", {"chat_id": "111", "text": "x"}) is None
+
+    _no_token_in_records(caplog)
+
+
+def test_api_get_error_redacts_token(monkeypatch, caplog):
+    _configure(monkeypatch, token=_SECRET_TOKEN, chats="111")
+    leaky_url = f"{config.TELEGRAM_API_BASE}/bot{_SECRET_TOKEN}/getUpdates"
+
+    def boom(url, params=None, timeout=None):
+        raise RuntimeError(f"Max retries exceeded with url: {leaky_url}")
+
+    monkeypatch.setattr(telegram_bot.requests, "get", boom)
+
+    with caplog.at_level(logging.ERROR):
+        assert telegram_bot._api_get("getUpdates", {"timeout": 0}) is None
+
+    _no_token_in_records(caplog)
+
+
+def test_poll_loop_error_redacts_token(monkeypatch, caplog):
+    _configure(monkeypatch, token=_SECRET_TOKEN, chats="111")
+    leaky_url = f"{config.TELEGRAM_API_BASE}/bot{_SECRET_TOKEN}/getUpdates"
+
+    def raising_get(method, params):
+        raise RuntimeError(f"HTTPSConnectionPool failure for {leaky_url}")
+
+    class _StopLoop(Exception):
+        pass
+
+    def stop_sleep(_seconds):
+        raise _StopLoop()
+
+    monkeypatch.setattr(telegram_bot, "_api_get", raising_get)
+    monkeypatch.setattr(telegram_bot.time, "sleep", stop_sleep)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(_StopLoop):
+            telegram_bot.run_telegram_bot()
+
+    _no_token_in_records(caplog)

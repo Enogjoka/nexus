@@ -53,6 +53,19 @@ def _warn_disabled_once() -> None:
         _warned_disabled = True
 
 
+def _redact(text: str) -> str:
+    """
+    Replace the bot token (when set and non-empty) with "**TOKEN**". The full
+    API URL embeds the token, and requests exceptions routinely quote the URL
+    they failed on — so every exception string that reaches a log line must
+    pass through here first. The token must never appear in a log record.
+    """
+    token = config.TELEGRAM_BOT_TOKEN
+    if token and text:
+        return text.replace(token, "**TOKEN**")
+    return text
+
+
 def _api_post(method: str, payload: dict) -> Optional[dict]:
     """POST to the Telegram API; return parsed JSON or None on any failure."""
     url = f"{config.TELEGRAM_API_BASE}/bot{config.TELEGRAM_BOT_TOKEN}/{method}"
@@ -61,7 +74,8 @@ def _api_post(method: str, payload: dict) -> Optional[dict]:
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:
-        logger.error("telegram: %s failed (%s)", method, exc)
+        # Never log the URL; redact the token out of the exception text.
+        logger.error("telegram: %s failed (%s)", method, _redact(str(exc)))
         return None
 
 
@@ -72,7 +86,8 @@ def _api_get(method: str, params: dict) -> Optional[dict]:
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:
-        logger.error("telegram: %s failed (%s)", method, exc)
+        # Never log the URL; redact the token out of the exception text.
+        logger.error("telegram: %s failed (%s)", method, _redact(str(exc)))
         return None
 
 
@@ -196,6 +211,8 @@ def run_telegram_bot() -> None:
             for update in (data or {}).get("result", []):
                 offset = update["update_id"] + 1
                 handle_update(update)
-        except Exception:
-            logger.exception("telegram: poll loop error; continuing")
+        except Exception as exc:
+            # exc_info=False so no traceback (which could quote the URL) is
+            # emitted; the redacted exception text is the whole log payload.
+            logger.error("telegram: poll loop error: %s", _redact(str(exc)), exc_info=False)
         time.sleep(config.TELEGRAM_POLL_SECONDS)
