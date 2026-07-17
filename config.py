@@ -101,6 +101,16 @@ OFFERED_ANCHORS = [
 ANALYSIS_COST_PER_MTOK_INPUT = 3.0
 ANALYSIS_COST_PER_MTOK_OUTPUT = 15.0
 
+# PAPER ENGINE (exec_/paper_engine.py)
+PAPER_TTL_HOURS = 24  # a PENDING signal older than this expires unfilled
+
+# TELEGRAM (ops/telegram_bot.py) — the bot talks to the raw Telegram HTTP API
+# via requests. The token and chat allowlist are SECRETS and live in the
+# environment only (see below); nothing here is a credential.
+TELEGRAM_POLL_SECONDS = 30
+TELEGRAM_TIMEOUT_SECONDS = 10
+TELEGRAM_API_BASE = "https://api.telegram.org"
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")

@@ -7,3 +7,4 @@ pandas
 ta
 numpy
 anthropic
+requests
