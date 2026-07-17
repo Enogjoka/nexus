@@ -6,3 +6,4 @@ yfinance
 pandas
 ta
 numpy
+anthropic

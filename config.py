@@ -82,6 +82,25 @@ CONFIDENCE_FLOOR = 40
 MACRO_DIVERGENCE_PENALTY = 8
 VOLATILE_PENALTY = 5
 
+# ANALYSIS (ai/analysis.py — the signal spine)
+ANALYSIS_MODEL = "claude-fable-5"
+ANALYSIS_MAX_TOKENS = 1500
+ANALYSIS_TIMEOUT_SECONDS = 60
+ANALYSIS_MIN_INTERVAL_MINUTES = 30
+# Exactly the anchors that build_anchor_map() can currently resolve. SESSION_HIGH
+# and SESSION_LOW are deliberately withheld until the session-level producer task
+# lands — offering an anchor the resolver cannot fill would only ever WAIT.
+OFFERED_ANCHORS = [
+    "CURRENT_BID", "CURRENT_ASK", "CURRENT_MID",
+    "H1_EMA20", "H1_EMA50", "H1_BB_UPPER", "H1_BB_LOWER", "H1_BB_MID",
+    "H4_EMA20", "H4_EMA50", "H4_SWING_HIGH", "H4_SWING_LOW",
+    "D1_EMA20", "D1_EMA50", "D1_SWING_HIGH", "D1_SWING_LOW",
+]
+# Estimated USD cost per 1M tokens, used ONLY to accumulate the daily budget
+# guard (STATE.budget_spent_today) — approximate, not a billing source of truth.
+ANALYSIS_COST_PER_MTOK_INPUT = 3.0
+ANALYSIS_COST_PER_MTOK_OUTPUT = 15.0
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
