@@ -301,6 +301,30 @@ def test_cycle_persists_signal(monkeypatch):
         database.execute("DELETE FROM signals WHERE id = %s", (signal_id,))
 
 
+@requires_db
+def test_cycle_unifies_symbol_across_validator_log_and_signal(monkeypatch):
+    # One cycle's validator_log rows and its signals row must carry the SAME
+    # symbol label (config.YF_SYMBOL = 'GC=F'), never the validator's internal
+    # 'XAUUSD' default.
+    monkeypatch.setattr(analysis, "call_claude", lambda prompt: canned_reply())
+    result = run_analysis_cycle(make_state(), NON_FIX_UTC)
+    assert result["outcome"] == "SIGNAL_PERSISTED"
+    signal_id = result["signal_id"]
+    try:
+        assert config.YF_SYMBOL == "GC=F"
+
+        sig_symbol = database.fetch("SELECT symbol FROM signals WHERE id = %s", (signal_id,))[0][0]
+        assert sig_symbol == "GC=F"
+
+        # The 8 newest validator_log rows are this cycle's (rule 0 + rules 1-7).
+        vlog = database.fetch("SELECT symbol FROM validator_log ORDER BY id DESC LIMIT 8")
+        assert len(vlog) == 8
+        assert all(row[0] == "GC=F" for row in vlog)
+        assert all(row[0] != "XAUUSD" for row in vlog)
+    finally:
+        database.execute("DELETE FROM signals WHERE id = %s", (signal_id,))
+
+
 def test_cycle_unresolvable_anchor_no_persist(monkeypatch):
     # Anchor D1_SWING_HIGH is valid, but we strip the 1d timeframe so it is
     # absent from the anchor map -> resolve() returns None.

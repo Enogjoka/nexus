@@ -330,6 +330,9 @@ def _build_validator_ctx(state: dict, utc_now: datetime) -> dict:
         "utc_now": utc_now,
         "rsi": {"h1": _ind("1h", "rsi14"), "h4": _ind("4h", "rsi14")},
         "regime": {"h4": _regime("4h"), "d1": _regime("1d")},
+        # Same label the signals row is written under (config.YF_SYMBOL), so one
+        # cycle's validator_log rows and its signal share a symbol and can be
+        # joined — never the validator's internal "XAUUSD" default.
         "symbol": config.YF_SYMBOL,
     }
 
