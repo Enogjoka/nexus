@@ -14,12 +14,25 @@ A single dead series never kills a fetch cycle or the polling loop.
 """
 import argparse
 import logging
+import re
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import requests
 from psycopg2.extras import execute_values
+
+# CLI-only: `python3 -m sensors.fred --once` is a standalone entry point, so
+# .env must be loaded here, BEFORE `import config` below reads the
+# environment. This must run before that import, not merely before main()'s
+# body -- config.py reads env vars at module-import time. A library import
+# of this module (or the agent loop started by a future backend) does NOT
+# hit this branch and simply inherits the parent process's environment,
+# exactly like scripts/run_one_cycle.py does for its own entry point.
+if __name__ == "__main__":
+    from dotenv import load_dotenv
+
+    load_dotenv()
 
 import config
 from core import database
@@ -30,6 +43,17 @@ logger = logging.getLogger(__name__)
 
 _OBSERVATIONS_URL = "https://api.stlouisfed.org/fred/series/observations"
 _FETCH_TIMEOUT_SECONDS = 15
+_URL_PATTERN = re.compile(r"https?://\S+")
+
+
+def _redact_url(text: str) -> str:
+    """
+    Strip any http(s) URL out of `text`. The FRED request URL carries
+    api_key as a query parameter, and requests exceptions routinely quote
+    the full URL they failed on in their message -- that URL must never
+    reach a log line.
+    """
+    return _URL_PATTERN.sub("**URL_REDACTED**", text)
 
 _DERIVED_KEYS = ("real_yield", "real_yield_5d_delta", "curve_2s10s", "breakeven_10y")
 
@@ -54,7 +78,15 @@ def fetch_series(series_id: str) -> Optional[List[Tuple[date, float]]]:
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
-        logger.error("fetch_series: request failed for series=%s (%s)", series_id, exc)
+        # Never log the request URL -- it carries api_key as a query param.
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        logger.error(
+            "fetch_series: request failed for series=%s status_code=%s error=%s: %s",
+            series_id,
+            status_code,
+            type(exc).__name__,
+            _redact_url(str(exc)),
+        )
         return None
 
     observations = data.get("observations") if isinstance(data, dict) else None

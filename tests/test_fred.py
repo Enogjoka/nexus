@@ -108,6 +108,26 @@ def test_fetch_series_request_failure_returns_none(monkeypatch, caplog):
     assert "request failed" in caplog.text
 
 
+def test_fetch_series_failure_never_logs_api_key(monkeypatch, caplog):
+    # A requests exception's message routinely quotes the full URL it failed
+    # on -- which carries api_key as a query param. It must never reach a log.
+    leaky_url = f"{fred._OBSERVATIONS_URL}?series_id=DFII10&api_key=SECRET123&file_type=json"
+
+    def boom(url, params=None, timeout=None):
+        raise RuntimeError(f"404 Client Error: Not Found for url: {leaky_url}")
+
+    monkeypatch.setattr(fred.requests, "get", boom)
+
+    with caplog.at_level(logging.ERROR):
+        result = fred.fetch_series("DFII10")
+
+    assert result is None
+    assert "SECRET123" not in caplog.text
+    assert "**URL_REDACTED**" in caplog.text
+    assert "DFII10" in caplog.text  # series id still identifiable
+    assert "request failed" in caplog.text
+
+
 # --------------------------------------------------------------------------
 # run_fred_cycle survives one dead series
 # --------------------------------------------------------------------------
