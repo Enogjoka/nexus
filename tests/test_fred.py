@@ -39,6 +39,15 @@ def _reset_macro_state():
         STATE.market_data.pop("macro", None)
 
 
+@pytest.fixture(autouse=True)
+def _reset_alert_dedup():
+    """fred._last_alert_at is module-level mutable state (run_fred_agent's
+    alert de-dup); reset it so one test's alert cannot suppress another's."""
+    fred._last_alert_at = None
+    yield
+    fred._last_alert_at = None
+
+
 class _FakeResp:
     def __init__(self, payload):
         self._payload = payload
@@ -128,6 +137,7 @@ def test_run_fred_cycle_survives_one_dead_series(monkeypatch):
     )
     assert rows and float(rows[0][0]) == 4.10
     assert STATE.get_market_data("macro")["fetched_at"] == derived["fetched_at"]
+    assert derived["last_success_at"] == derived["fetched_at"]  # DGS10 succeeded this pass
 
     database.execute("DELETE FROM macro_observations WHERE series='DGS10' AND ts=%s", (date(2099, 6, 1),))
 
@@ -215,6 +225,54 @@ def test_check_staleness_no_prior_fetch_returns_none():
     assert fred.check_staleness(datetime(2026, 7, 18, tzinfo=timezone.utc)) is None
 
 
+def test_check_staleness_prefers_last_success_at_when_present():
+    # last_success_at is fresh (1h old); fetched_at is stale (17 days old) but
+    # must be IGNORED whenever last_success_at is set -- data success, not
+    # scheduler liveness, is what staleness tracks.
+    STATE.update_market_data(
+        "macro",
+        {
+            "last_success_at": datetime(2026, 7, 18, 2, 0, tzinfo=timezone.utc).isoformat(),
+            "fetched_at": datetime(2026, 7, 1, 0, 0, tzinfo=timezone.utc).isoformat(),
+        },
+    )
+    now = datetime(2026, 7, 18, 3, 0, tzinfo=timezone.utc)
+    assert fred.check_staleness(now) is None
+
+
+@requires_db
+def test_all_series_failing_over_time_eventually_stale(monkeypatch):
+    # Every series fails on every pass -- last_success_at never gets set.
+    monkeypatch.setattr(fred, "fetch_series", lambda series_id: None)
+
+    t0 = datetime(2099, 3, 1, 0, 0, tzinfo=timezone.utc)
+    for hours in (0, 10, 20):
+        fred.run_fred_cycle(t0 + timedelta(hours=hours))
+
+    macro = STATE.get_market_data("macro")
+    assert macro["last_success_at"] is None  # never once succeeded
+
+    # No new pass has run since t0+20h; the clock advances past the threshold.
+    later = t0 + timedelta(hours=20 + config.STALE_DATA_ALERT_HOURS + 1)
+    warning = fred.check_staleness(later)
+    assert warning is not None
+    assert "stale" in warning.lower()
+
+
+@requires_db
+def test_partial_success_sets_fresh_last_success_no_warning(monkeypatch):
+    def fake_fetch(series_id):
+        return [(date(2099, 7, 1), 1.5)] if series_id == "DFII10" else None
+
+    monkeypatch.setattr(fred, "fetch_series", fake_fetch)
+
+    now = datetime(2099, 7, 1, 12, tzinfo=timezone.utc)
+    derived = fred.run_fred_cycle(now)
+
+    assert derived["last_success_at"] == now.isoformat()
+    assert fred.check_staleness(now) is None
+
+
 def test_run_fred_agent_alerts_once_per_stale_iteration(monkeypatch):
     STATE.update_market_data(
         "macro", {"fetched_at": datetime(2026, 7, 1, tzinfo=timezone.utc).isoformat()}
@@ -237,3 +295,35 @@ def test_run_fred_agent_alerts_once_per_stale_iteration(monkeypatch):
 
     assert calls["send_alert"] == 1
     assert calls["cycle"] == 1
+
+
+def test_alert_dedup_two_consecutive_stale_iterations_sends_once(monkeypatch):
+    # Stale from the start, and stays stale: run_fred_cycle is mocked as a
+    # no-op that never advances last_success_at/fetched_at, so BOTH loop
+    # iterations see the same stale condition.
+    STATE.update_market_data(
+        "macro",
+        {"fetched_at": datetime(2026, 7, 1, tzinfo=timezone.utc).isoformat(), "last_success_at": None},
+    )
+
+    calls = {"send_alert": 0, "cycle": 0}
+    monkeypatch.setattr(fred, "send_alert", lambda text: calls.__setitem__("send_alert", calls["send_alert"] + 1))
+    monkeypatch.setattr(fred, "run_fred_cycle", lambda now: calls.__setitem__("cycle", calls["cycle"] + 1))
+
+    class _StopLoop(Exception):
+        pass
+
+    iterations = {"n": 0}
+
+    def stop_after_two(_seconds):
+        iterations["n"] += 1
+        if iterations["n"] >= 2:
+            raise _StopLoop()
+
+    monkeypatch.setattr(fred.time, "sleep", stop_after_two)
+
+    with pytest.raises(_StopLoop):
+        fred.run_fred_agent()
+
+    assert calls["cycle"] == 2       # the loop ran twice
+    assert calls["send_alert"] == 1  # but the alert was de-duped to once

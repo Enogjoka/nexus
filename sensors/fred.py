@@ -148,11 +148,13 @@ def run_fred_cycle(now_utc: datetime) -> dict:
     HTTP call never ties up a pooled connection.
     """
     fetched: Dict[str, List[Tuple[date, float]]] = {}
+    any_success = False
     for series_id in config.FRED_SERIES:
         pairs = fetch_series(series_id)
         if pairs is None:
             logger.warning("run_fred_cycle: fetch failed for series=%s; continuing", series_id)
             continue
+        any_success = True  # FRED was successfully reached and parsed for this series
         fetched[series_id] = pairs
 
     try:
@@ -165,56 +167,89 @@ def run_fred_cycle(now_utc: datetime) -> dict:
         derived = {k: None for k in _DERIVED_KEYS}
 
     derived = dict(derived)
+    # fetched_at: this pass COMPLETED (display/liveness only — see check_staleness).
+    # last_success_at: at least one series was actually reached and parsed this
+    # pass. If this pass had zero successes, carry the PRIOR last_success_at
+    # forward rather than clobbering it with None -- staleness is judged on
+    # data success, not on whether the scheduler is merely still looping.
     derived["fetched_at"] = now_utc.isoformat()
+    if any_success:
+        derived["last_success_at"] = now_utc.isoformat()
+    else:
+        prior = STATE.get_market_data("macro")
+        derived["last_success_at"] = prior.get("last_success_at") if isinstance(prior, dict) else None
     STATE.update_market_data("macro", derived)
     BUS.publish("macro_update", derived)
     return derived
 
 
+def _age_hours(now_utc: datetime, iso_str) -> Optional[float]:
+    """Hours between now_utc and an ISO timestamp string, or None if absent/unparseable."""
+    if not isinstance(iso_str, str):
+        return None
+    try:
+        ts = datetime.fromisoformat(iso_str)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (now_utc - ts).total_seconds() / 3600.0
+
+
 def check_staleness(now_utc: datetime) -> Optional[str]:
     """
-    A dead-man's-switch: if the macro sensor's last recorded fetch is older
-    than config.STALE_DATA_ALERT_HOURS, return a plain factual warning
-    string (no interpretation). If nothing has been fetched yet, or the
-    timestamp is unreadable, there is nothing to call stale -> None.
+    A dead-man's-switch on DATA SUCCESS, not scheduler liveness: a loop that
+    keeps running while every fetch fails must still be called stale.
+
+    Compares now against last_success_at (the last pass with >=1 successful
+    series fetch). If we have never once succeeded, fall back to fetched_at
+    (the last pass completion) as the failing-duration signal -- so a chain
+    of all-failing passes still eventually trips the alert. If neither is
+    set, the agent has never run a pass at all -> nothing to compare -> None.
     """
     macro = STATE.get_market_data("macro")
     if not isinstance(macro, dict):
         return None
-    fetched_at_raw = macro.get("fetched_at")
-    if not isinstance(fetched_at_raw, str):
-        return None
-    try:
-        fetched_at = datetime.fromisoformat(fetched_at_raw)
-    except ValueError:
-        return None
-    if fetched_at.tzinfo is None:
-        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
 
-    age_hours = (now_utc - fetched_at).total_seconds() / 3600.0
-    if age_hours > config.STALE_DATA_ALERT_HOURS:
+    age = _age_hours(now_utc, macro.get("last_success_at"))
+    if age is None:
+        age = _age_hours(now_utc, macro.get("fetched_at"))
+        if age is None:
+            return None  # agent never ran a pass; nothing to compare
+
+    if age > config.STALE_DATA_ALERT_HOURS:
         return (
-            f"NEXUS macro sensor stale: last fetch {age_hours:.1f}h ago "
+            f"NEXUS macro sensor stale: no successful fetch in {age:.1f}h "
             f"(threshold {config.STALE_DATA_ALERT_HOURS}h)"
         )
     return None
 
 
+# Module-local de-dup state for run_fred_agent's alerting: the ONLY writer is
+# run_fred_agent's own loop, which runs single-file. Once a stale warning is
+# sent, it is not re-sent every poll pass -- at most once per
+# STALE_DATA_ALERT_HOURS, so a prolonged outage pages once, not every pass.
+_last_alert_at: Optional[datetime] = None
+
+
 def run_fred_agent() -> None:
     """
     Poll every config.FRED_POLL_MINUTES. Each iteration: check staleness of
-    the PREVIOUS cycle's fetch first (so a run of failing cycles eventually
-    surfaces a Telegram alert once per iteration it stays stale), then run
-    one fetch cycle. Any exception is logged and swallowed so the loop
-    survives (INVARIANT 6); ops.telegram_bot.send_alert's no-op contract
-    makes the alert call safe even when Telegram is unconfigured.
+    the PREVIOUS pass's data-success timestamp first, alert (de-duped) if
+    stale, then run one fetch cycle. Any exception is logged and swallowed
+    so the loop survives (INVARIANT 6); ops.telegram_bot.send_alert's no-op
+    contract makes the alert call safe even when Telegram is unconfigured.
     """
+    global _last_alert_at
     while True:
         try:
             now = datetime.now(timezone.utc)
             warning = check_staleness(now)
             if warning is not None:
-                send_alert(warning)
+                dedup_window = timedelta(hours=config.STALE_DATA_ALERT_HOURS)
+                if _last_alert_at is None or (now - _last_alert_at) >= dedup_window:
+                    send_alert(warning)
+                    _last_alert_at = now
             run_fred_cycle(now)
         except Exception:
             logger.exception("run_fred_agent: cycle failed; continuing")
