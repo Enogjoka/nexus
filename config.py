@@ -111,6 +111,14 @@ TELEGRAM_POLL_SECONDS = 30
 TELEGRAM_TIMEOUT_SECONDS = 10
 TELEGRAM_API_BASE = "https://api.telegram.org"
 
+# MACRO (sensors/fred.py) — real yields, breakevens, and the 2s10s curve.
+# Numbers only: no interpretation of what a reading MEANS lives here or in
+# the sensor — that belongs to the analyst prompt (a later task).
+FRED_SERIES = ["DFII10", "DGS10", "DGS2", "T10YIE", "M2SL", "WALCL"]
+FRED_POLL_MINUTES = 60
+FRED_LOOKBACK_DAYS = 400
+STALE_DATA_ALERT_HOURS = 26  # dead-man's-switch threshold for the macro sensor
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
