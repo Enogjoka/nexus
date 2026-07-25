@@ -93,7 +93,11 @@ def fetch_feed(url: str) -> list:
     than silently returned as "no news".
     """
     try:
-        resp = requests.get(url, timeout=config.NEWS_FETCH_TIMEOUT_SECONDS)
+        resp = requests.get(
+            url,
+            timeout=config.NEWS_FETCH_TIMEOUT_SECONDS,
+            headers={"User-Agent": config.NEWS_USER_AGENT},
+        )
         resp.raise_for_status()
         content = resp.content
     except Exception as exc:
@@ -159,12 +163,17 @@ def net_news_heat(conn, now_utc: datetime) -> float:
     fetched in the last config.NEWS_HEAT_LOOKBACK_HOURS (only passing articles
     are ever persisted, so a straight row count in the window IS that count).
     Crude by design; the scored version replaces it in fusion.
+
+    Lower bound only (no `fetched_at <= now_utc`): a cycle captures now_utc at
+    its start but the rows it inserts get a DB NOW() a few seconds LATER, so an
+    upper bound of now_utc would wrongly exclude the very articles this cycle
+    just fetched. "Last 6h" needs only the floor.
     """
     window_start = now_utc - timedelta(hours=config.NEWS_HEAT_LOOKBACK_HOURS)
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT count(*) FROM news_articles WHERE fetched_at >= %s AND fetched_at <= %s",
-            (window_start, now_utc),
+            "SELECT count(*) FROM news_articles WHERE fetched_at >= %s",
+            (window_start,),
         )
         count = cur.fetchone()[0]
     return math.tanh(count / 10.0)

@@ -94,7 +94,7 @@ class _FakeResp:
 
 
 def test_fetch_feed_request_failure_returns_empty_and_logs(monkeypatch, caplog):
-    def boom(url, timeout=None):
+    def boom(url, timeout=None, headers=None):
         raise RuntimeError("connection reset")
 
     monkeypatch.setattr(news.requests, "get", boom)
@@ -106,7 +106,7 @@ def test_fetch_feed_request_failure_returns_empty_and_logs(monkeypatch, caplog):
     assert "request failed" in caplog.text
 
 
-def test_fetch_feed_parses_canned_rss_bytes(monkeypatch):
+def test_fetch_feed_sends_user_agent_and_parses(monkeypatch):
     rss = (
         b'<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
         b"<item><title>Gold rallies to record</title>"
@@ -114,10 +114,17 @@ def test_fetch_feed_parses_canned_rss_bytes(monkeypatch):
         b"<description>gold up on Fed</description></item>"
         b"</channel></rss>"
     )
-    monkeypatch.setattr(news.requests, "get", lambda url, timeout=None: _FakeResp(content=rss))
+    captured = {}
+
+    def fake_get(url, timeout=None, headers=None):
+        captured["headers"] = headers
+        return _FakeResp(content=rss)
+
+    monkeypatch.setattr(news.requests, "get", fake_get)
 
     entries = news.fetch_feed("http://feed")  # real feedparser runs on the mocked bytes
 
+    assert captured["headers"]["User-Agent"] == config.NEWS_USER_AGENT  # UA sent on every GET
     assert len(entries) == 1
     assert entries[0].title == "Gold rallies to record"
     assert entries[0].link == "http://tst-news/a"
@@ -127,7 +134,9 @@ def test_fetch_feed_logs_bozo_feed_with_zero_entries(monkeypatch, caplog):
     # The feed downloads but is unparseable -> feedparser returns bozo=True
     # with 0 entries. That must be LOGGED (INVARIANT 6), not silently treated
     # as "no news".
-    monkeypatch.setattr(news.requests, "get", lambda url, timeout=None: _FakeResp(content=b"garbage"))
+    monkeypatch.setattr(
+        news.requests, "get", lambda url, timeout=None, headers=None: _FakeResp(content=b"garbage")
+    )
     monkeypatch.setattr(
         news.feedparser, "parse",
         lambda content: SimpleNamespace(entries=[], bozo=True, bozo_exception=OSError("bad xml")),
@@ -186,8 +195,29 @@ def test_net_news_heat_tanh_math():
 
 
 @requires_db
+def test_net_news_heat_counts_same_cycle_rows():
+    # The real-cycle case the old `fetched_at <= now_utc` upper bound broke:
+    # now_utc is captured FIRST, then rows are inserted with DB NOW() (which
+    # lands strictly AFTER now_utc). With the lower-bound-only window they must
+    # still be counted -> heat > 0. (Exact count isn't asserted here because
+    # ambient recent rows may also fall in the live 6h window.)
+    now_utc = datetime.now(timezone.utc)
+    with database.get_conn() as conn:
+        with conn.cursor() as cur:
+            for i in range(3):
+                url = f"http://tst-news/cycle-{i}"
+                cur.execute(
+                    "INSERT INTO news_articles (url_hash, url, source, title) "
+                    "VALUES (%s, %s, 'TestSrc', 'Gold')",  # fetched_at -> DB NOW(), after now_utc
+                    (news.url_hash(url), url),
+                )
+        heat = news.net_news_heat(conn, now_utc)
+    assert heat > 0.0
+
+
+@requires_db
 def test_net_news_heat_empty_window_is_zero():
     with database.get_conn() as conn:
-        # far-future window with nothing in it -> tanh(0) == 0.0
+        # far-future window with nothing at/after it -> tanh(0) == 0.0
         heat = news.net_news_heat(conn, datetime(2099, 1, 1, 0, 0, tzinfo=timezone.utc))
     assert heat == 0.0

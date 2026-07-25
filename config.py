@@ -146,13 +146,17 @@ EVENT_LOOKAHEAD_MINUTES = 120  # window upcoming_events() returns to the validat
 # NEWS (sensors/news.py) — RSS pipeline + Stage-1 keyword prefilter. Stage-2 AI
 # scoring is deferred to the fusion task (relevance/direction stay NULL here).
 NEWS_FEEDS = {
-    "Kitco": "https://www.kitco.com/rss/KitcoNews.xml",
+    # Kitco: URL moved, restore when confirmed (kitco.com/rss/KitcoNews.xml and
+    # trivial variants all 404 with no redirect; a dead feed is noise, not coverage).
     "Mining.com": "https://www.mining.com/feed/",
     "GoogleNews_Gold": "https://news.google.com/rss/search?q=gold+OR+XAUUSD&hl=en-US&gl=US&ceid=US:en",
     "Fed": "https://www.federalreserve.gov/feeds/press_all.xml",
     "BLS": "https://www.bls.gov/feed/news_release/bls_all.rss",
     "MarketWatch": "https://feeds.marketwatch.com/marketwatch/topstories/",
 }
+# Sent as the User-Agent on every feed GET. Some sites (e.g. BLS) block all
+# non-browser UAs regardless -- their 403 is then the honest logged artifact.
+NEWS_USER_AGENT = "NEXUS/1.0 (+private research)"
 NEWS_POLL_MINUTES = 15
 NEWS_FETCH_TIMEOUT_SECONDS = 15  # requests per-call timeout for each feed GET
 NEWS_HEAT_LOOKBACK_HOURS = 6
