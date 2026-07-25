@@ -10,3 +10,4 @@ anthropic
 requests
 openpyxl
 xlrd
+feedparser
