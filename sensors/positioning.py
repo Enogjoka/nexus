@@ -75,6 +75,51 @@ _COT_EXPECTED_KEYS = {
 # ==========================================================================
 
 
+def _probe_commodity_values() -> None:
+    """
+    The commodity_name filter returned zero rows with a valid 200 -- rather
+    than guess at a different filter value or field (e.g. a
+    market_and_exchange_names LIKE clause), probe unfiltered and log the
+    DISTINCT commodity/market/exchange-ish field values actually present in
+    a small sample, so a human can pick the correct filter. No fuzzy
+    substitution: this only logs, it never changes what fetch_cot() does.
+    """
+    try:
+        resp = requests.get(config.COT_SOCRATA_URL, params={"$limit": 5}, timeout=_COT_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+        probe_rows = resp.json()
+    except Exception as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        logger.error(
+            "fetch_cot: commodity_name='%s' returned zero rows; unfiltered probe request "
+            "failed status_code=%s error=%s",
+            config.COT_COMMODITY_FILTER,
+            status_code,
+            type(exc).__name__,
+        )
+        return
+
+    if not isinstance(probe_rows, list) or not probe_rows:
+        logger.error(
+            "fetch_cot: commodity_name='%s' returned zero rows; unfiltered probe was also "
+            "empty/malformed (%s)",
+            config.COT_COMMODITY_FILTER,
+            type(probe_rows).__name__,
+        )
+        return
+
+    commodity_ish_keys = sorted(
+        k for k in probe_rows[0].keys() if any(tok in k.lower() for tok in ("commodity", "market", "exchange"))
+    )
+    distinct_values = {k: sorted({str(row.get(k)) for row in probe_rows}) for k in commodity_ish_keys}
+    logger.error(
+        "fetch_cot: commodity_name='%s' returned zero rows; distinct commodity/market/"
+        "exchange-ish field values from an unfiltered $limit=5 probe: %s",
+        config.COT_COMMODITY_FILTER,
+        distinct_values,
+    )
+
+
 def fetch_cot() -> Optional[List[dict]]:
     """
     Fetch the most recent COT rows for gold from the CFTC's public Socrata
@@ -82,7 +127,9 @@ def fetch_cot() -> Optional[List[dict]]:
     any failure (INVARIANT 6). This feed's column names have drifted
     historically — if the expected keys are absent from the first row, the
     actual keys present are logged and this returns None; there is no
-    fuzzy/best-effort substitution.
+    fuzzy/best-effort substitution. Likewise, if the commodity_name filter
+    itself is wrong for this dataset (zero rows on a valid 200), an
+    unfiltered probe logs the actual field values rather than guessing.
     """
     params = {
         "$where": f"commodity_name='{config.COT_COMMODITY_FILTER}'",
@@ -102,8 +149,12 @@ def fetch_cot() -> Optional[List[dict]]:
         )
         return None
 
-    if not isinstance(rows, list) or not rows:
-        logger.error("fetch_cot: unexpected/empty response shape (%s)", type(rows).__name__)
+    if not isinstance(rows, list):
+        logger.error("fetch_cot: unexpected response shape (%s)", type(rows).__name__)
+        return None
+
+    if not rows:
+        _probe_commodity_values()
         return None
 
     actual_keys = set(rows[0].keys())

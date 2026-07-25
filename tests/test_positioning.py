@@ -144,6 +144,52 @@ def test_fetch_cot_request_failure_returns_none(monkeypatch, caplog):
     assert "request failed" in caplog.text
 
 
+def test_fetch_cot_zero_rows_triggers_probe_and_logs_distinct_values(monkeypatch, caplog):
+    # A valid 200 with an empty list means the commodity filter itself may be
+    # wrong for this dataset -- fetch_cot() must probe unfiltered and log the
+    # actual field values rather than guess at a different filter.
+    probe_rows = [
+        {"commodity_name": "GOLD - COMMODITY EXCHANGE INC.",
+         "market_and_exchange_names": "GOLD - COMMODITY EXCHANGE INC."},
+        {"commodity_name": "SILVER - COMMODITY EXCHANGE INC.",
+         "market_and_exchange_names": "SILVER - COMMODITY EXCHANGE INC."},
+    ]
+    calls = []
+
+    def fake_get(url, params=None, timeout=None):
+        calls.append(params)
+        if "$where" in params:
+            return _FakeResp(payload=[])  # filtered query: zero rows
+        return _FakeResp(payload=probe_rows)  # unfiltered probe
+
+    monkeypatch.setattr(pos.requests, "get", fake_get)
+
+    with caplog.at_level(logging.ERROR):
+        result = pos.fetch_cot()
+
+    assert result is None
+    assert len(calls) == 2
+    assert "$where" not in calls[1]
+    assert calls[1]["$limit"] == 5
+    assert "GOLD - COMMODITY EXCHANGE INC." in caplog.text
+    assert "SILVER - COMMODITY EXCHANGE INC." in caplog.text
+
+
+def test_fetch_cot_zero_rows_probe_itself_fails(monkeypatch, caplog):
+    def fake_get(url, params=None, timeout=None):
+        if "$where" in params:
+            return _FakeResp(payload=[])
+        raise RuntimeError("probe connection reset")
+
+    monkeypatch.setattr(pos.requests, "get", fake_get)
+
+    with caplog.at_level(logging.ERROR):
+        result = pos.fetch_cot()
+
+    assert result is None
+    assert "probe" in caplog.text.lower()
+
+
 # --------------------------------------------------------------------------
 # COMEX workbook parsing (pure function, canned bytes, no network)
 # --------------------------------------------------------------------------

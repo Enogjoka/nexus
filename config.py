@@ -121,7 +121,10 @@ STALE_DATA_ALERT_HOURS = 26  # dead-man's-switch threshold for the macro sensor
 
 # POSITIONING (sensors/positioning.py) — who is actually long gold.
 # Numbers only: no interpretation lives here or in the sensor.
-COT_SOCRATA_URL = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
+# Disaggregated Futures Only -- carries the Managed Money taxonomy
+# (m_money_positions_*). The old 6dca-aqww (Legacy Futures Only) does not
+# have Managed Money fields at all and stays gone -- see task 8 fix pass.
+COT_SOCRATA_URL = "https://publicreporting.cftc.gov/resource/72hh-3qpy.json"
 COT_COMMODITY_FILTER = "GOLD"
 POSITIONING_POLL_HOURS = 6
 COT_PCTILE_LOOKBACK_WEEKS = 156  # 3 years for percentile rank
