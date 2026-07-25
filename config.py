@@ -119,6 +119,13 @@ FRED_POLL_MINUTES = 60
 FRED_LOOKBACK_DAYS = 400
 STALE_DATA_ALERT_HOURS = 26  # dead-man's-switch threshold for the macro sensor
 
+# POSITIONING (sensors/positioning.py) — who is actually long gold.
+# Numbers only: no interpretation lives here or in the sensor.
+COT_SOCRATA_URL = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
+COT_COMMODITY_FILTER = "GOLD"
+POSITIONING_POLL_HOURS = 6
+COT_PCTILE_LOOKBACK_WEEKS = 156  # 3 years for percentile rank
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")

@@ -8,3 +8,5 @@ ta
 numpy
 anthropic
 requests
+openpyxl
+xlrd
