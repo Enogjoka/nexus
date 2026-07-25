@@ -126,6 +126,12 @@ STALE_DATA_ALERT_HOURS = 26  # dead-man's-switch threshold for the macro sensor
 # have Managed Money fields at all and stays gone -- see task 8 fix pass.
 COT_SOCRATA_URL = "https://publicreporting.cftc.gov/resource/72hh-3qpy.json"
 COT_COMMODITY_FILTER = "GOLD"
+# commodity_name='GOLD' matches multiple contracts on the disaggregated
+# dataset (e.g. standard 100oz COMEX gold AND e-micro gold), each reporting
+# its own open_interest under the same report_date -- pinning to a single
+# market_and_exchange_names value is what makes cot_reports one coherent
+# time series instead of a blend of different contracts. See task 8 fix 2.
+COT_MARKET_NAME = "GOLD - COMMODITY EXCHANGE INC."
 POSITIONING_POLL_HOURS = 6
 COT_PCTILE_LOOKBACK_WEEKS = 156  # 3 years for percentile rank
 

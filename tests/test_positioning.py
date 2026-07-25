@@ -64,6 +64,7 @@ def _canned_cot_row(**overrides):
     row = {
         "report_date_as_yyyy_mm_dd": "2026-07-14T00:00:00.000",
         "commodity_name": "GOLD",
+        "market_and_exchange_names": config.COT_MARKET_NAME,
         "m_money_positions_long_all": "150000",
         "m_money_positions_short_all": "50000",
         "open_interest_all": "450000",
@@ -111,10 +112,38 @@ def test_fetch_cot_parses_canned_json(monkeypatch):
          "mm_net": 80000, "open_interest": 440000},
     ]
     assert len(calls) == 1
-    assert calls[0]["params"]["$where"] == "commodity_name='GOLD'"
+    assert calls[0]["params"]["$where"] == f"market_and_exchange_names='{config.COT_MARKET_NAME}'"
     assert calls[0]["params"]["$order"] == "report_date_as_yyyy_mm_dd DESC"
     assert calls[0]["params"]["$limit"] == 200
     assert calls[0]["timeout"] == 20
+
+
+def test_fetch_cot_filters_out_other_contracts_client_side(monkeypatch):
+    # Two contracts under the same report_date, as the disaggregated dataset
+    # actually returns for commodity_name='GOLD': the pinned standard 100oz
+    # COMEX contract (OI 383k) and e-micro gold (OI 70k). Even if the
+    # server-side filter somehow let both through, only the pinned contract's
+    # rows may ever be parsed -- the micro row must never reach persist.
+    standard_row = _canned_cot_row(
+        market_and_exchange_names=config.COT_MARKET_NAME,
+        open_interest_all="383000",
+    )
+    micro_row = _canned_cot_row(
+        market_and_exchange_names="GOLD-MICRO - COMMODITY EXCHANGE INC.",
+        open_interest_all="70000",
+    )
+
+    monkeypatch.setattr(
+        pos.requests, "get", lambda url, params=None, timeout=None: _FakeResp(payload=[standard_row, micro_row])
+    )
+
+    result = pos.fetch_cot()
+
+    assert result == [
+        {"report_date": date(2026, 7, 14), "mm_long": 150000, "mm_short": 50000,
+         "mm_net": 100000, "open_interest": 383000},
+    ]
+    assert len(result) == 1  # the micro row never reaches the parsed output
 
 
 def test_fetch_cot_missing_expected_keys_returns_none_and_logs(monkeypatch, caplog):
@@ -145,14 +174,13 @@ def test_fetch_cot_request_failure_returns_none(monkeypatch, caplog):
 
 
 def test_fetch_cot_zero_rows_triggers_probe_and_logs_distinct_values(monkeypatch, caplog):
-    # A valid 200 with an empty list means the commodity filter itself may be
+    # A valid 200 with an empty list means the market filter itself may be
     # wrong for this dataset -- fetch_cot() must probe unfiltered and log the
-    # actual field values rather than guess at a different filter.
+    # actual market_and_exchange_names values rather than guess at a
+    # different filter value.
     probe_rows = [
-        {"commodity_name": "GOLD - COMMODITY EXCHANGE INC.",
-         "market_and_exchange_names": "GOLD - COMMODITY EXCHANGE INC."},
-        {"commodity_name": "SILVER - COMMODITY EXCHANGE INC.",
-         "market_and_exchange_names": "SILVER - COMMODITY EXCHANGE INC."},
+        {"market_and_exchange_names": "GOLD - COMMODITY EXCHANGE INC."},
+        {"market_and_exchange_names": "GOLD-MICRO - COMMODITY EXCHANGE INC."},
     ]
     calls = []
 
@@ -172,7 +200,7 @@ def test_fetch_cot_zero_rows_triggers_probe_and_logs_distinct_values(monkeypatch
     assert "$where" not in calls[1]
     assert calls[1]["$limit"] == 5
     assert "GOLD - COMMODITY EXCHANGE INC." in caplog.text
-    assert "SILVER - COMMODITY EXCHANGE INC." in caplog.text
+    assert "GOLD-MICRO - COMMODITY EXCHANGE INC." in caplog.text
 
 
 def test_fetch_cot_zero_rows_probe_itself_fails(monkeypatch, caplog):
