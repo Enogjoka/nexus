@@ -12,21 +12,23 @@ DEFERRED (documented, not silently skipped):
     url_hash primary-dedup key only (ON CONFLICT DO NOTHING). A one-time TODO
     is logged so the gap is visible, not hidden.
 
-INVARIANT 6: feedparser has no per-call timeout, so we set the process socket
-default around each parse and ALWAYS restore it (try/finally), even if the
-parse raises. Any feed failure is logged and yields an empty entry list --
+INVARIANT 6: each feed is fetched with requests (timeout 15s, try/except ->
+log + []), and only the downloaded bytes are handed to feedparser.parse().
+requests brings certifi's CA bundle, so TLS verification actually succeeds
+where feedparser's bare-urllib fetch did not. Any feed failure is logged
+(no URL in the message, Task 7 pattern) and yields an empty entry list --
 one dead feed never kills the cycle or the loop.
 """
 import argparse
 import hashlib
 import logging
 import math
-import socket
 import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import feedparser
+import requests
 
 # CLI-only: `python3 -m sensors.news --once` is a standalone entry point, so
 # .env must be loaded here, BEFORE `import config` below reads the environment
@@ -83,26 +85,24 @@ def url_hash(url: str) -> str:
 
 def fetch_feed(url: str) -> list:
     """
-    Parse one RSS feed's entries. feedparser has no per-call timeout, so the
-    process socket default is set to config.NEWS_SOCKET_TIMEOUT_SECONDS around
-    the parse and ALWAYS restored afterward (even on exception). Any failure
-    is logged and returns an empty list (INVARIANT 6).
+    Fetch one RSS feed with requests (so certifi's CA bundle is used for TLS)
+    and hand the raw bytes to feedparser.parse(). Any request failure is
+    logged and returns an empty list (INVARIANT 6); the URL is never logged
+    (Task 7 pattern). A feed that downloads but is unparseable comes back
+    from feedparser as `bozo` with zero entries -- that too is logged rather
+    than silently returned as "no news".
     """
-    previous_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(config.NEWS_SOCKET_TIMEOUT_SECONDS)
     try:
-        parsed = feedparser.parse(url)
+        resp = requests.get(url, timeout=config.NEWS_FETCH_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+        content = resp.content
     except Exception as exc:
-        logger.error("fetch_feed: parse failed error=%s", type(exc).__name__)
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        logger.error("fetch_feed: request failed status_code=%s error=%s", status_code, type(exc).__name__)
         return []
-    finally:
-        socket.setdefaulttimeout(previous_timeout)
 
+    parsed = feedparser.parse(content)
     entries = list(getattr(parsed, "entries", []) or [])
-    # feedparser never raises: a network/TLS/parse failure is captured on the
-    # result as `bozo` with an empty entry list. INVARIANT 6 requires that
-    # failure be LOGGED, not silently returned as "no news". The exception
-    # class only (no URL -- feeds are public but keep the Task 7 discipline).
     if not entries and getattr(parsed, "bozo", False):
         bozo_exc = getattr(parsed, "bozo_exception", None)
         logger.error(

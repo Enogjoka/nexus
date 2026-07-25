@@ -154,14 +154,14 @@ NEWS_FEEDS = {
     "MarketWatch": "https://feeds.marketwatch.com/marketwatch/topstories/",
 }
 NEWS_POLL_MINUTES = 15
-NEWS_SOCKET_TIMEOUT_SECONDS = 15  # feedparser has no per-call timeout; set the socket default
+NEWS_FETCH_TIMEOUT_SECONDS = 15  # requests per-call timeout for each feed GET
 NEWS_HEAT_LOOKBACK_HOURS = 6
 # Stage-1 keyword prefilter (case-insensitive substring match). An article
 # passes if: >=1 GOLD_DIRECT hit, OR >=2 distinct GOLD_MACRO hits, OR >=2
-# distinct GOLD_GEOPOLITICAL hits.
+# distinct GOLD_GEOPOLITICAL hits. Includes the v4 seed words.
 GOLD_DIRECT = [
-    "gold", "xauusd", "xau/usd", "xau", "bullion", "gld", "comex gold",
-    "spdr gold", "gold price", "gold futures",
+    "gold", "xauusd", "xau/usd", "xau", "bullion", "comex", "lbma", "gld",
+    "comex gold", "spdr gold", "gold price", "gold futures",
 ]
 GOLD_MACRO = [
     "fed", "fomc", "federal reserve", "powell", "interest rate", "rate cut",

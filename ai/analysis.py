@@ -314,8 +314,9 @@ def extract_signal(raw: str) -> Tuple[Optional[SignalAnchors], dict]:
 
 
 def _build_validator_ctx(state: dict, utc_now: datetime) -> dict:
-    """rsi h1/h4 + regime h4/d1 + the clock. upcoming_events/macro_regime are
-    intentionally omitted until Tasks 9/8 land (the validator SKIPs them)."""
+    """rsi h1/h4 + regime h4/d1 + the clock + upcoming_events (wired in Task 9
+    from the calendar sensor; the validator SKIPs it when absent). macro_regime
+    remains absent until the fusion task wires it in."""
     def _ind(tf: str, key: str):
         d = state.get(tf)
         if isinstance(d, dict) and isinstance(d.get("indicators"), dict):

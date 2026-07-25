@@ -1,13 +1,13 @@
 """
 Acceptance tests for Task 9 (news half): sensors/news.py.
 
-NO network: feedparser.parse is always monkeypatched. DB-backed tests use
-url-prefixed test rows (http://tst-news/...) with FAR-FUTURE fetched_at so
-net_news_heat's window can't pull in ambient real rows; the autouse fixture
-purges them afterward.
+NO network: requests.get is always monkeypatched (feedparser then runs on the
+mocked bytes, which is pure/offline). DB-backed tests use url-prefixed test
+rows (http://tst-news/...) with FAR-FUTURE fetched_at so net_news_heat's
+window can't pull in ambient real rows; the autouse fixture purges them
+afterward.
 """
 import logging
-import socket
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -80,49 +80,57 @@ def test_url_hash_is_stable_16_hex_chars():
 
 
 # --------------------------------------------------------------------------
-# fetch_feed: socket timeout set during parse, ALWAYS restored
+# fetch_feed: requests fetch -> feedparser.parse(bytes)
 # --------------------------------------------------------------------------
 
 
-def test_fetch_feed_sets_and_restores_socket_timeout(monkeypatch):
-    socket.setdefaulttimeout(None)  # known baseline
-    observed = {}
+class _FakeResp:
+    def __init__(self, content=b"", status=200):
+        self.content = content
+        self.status_code = status
 
-    def fake_parse(url):
-        observed["during"] = socket.getdefaulttimeout()
-        return SimpleNamespace(entries=[SimpleNamespace(title="Gold up", link="http://x/1")])
-
-    monkeypatch.setattr(news.feedparser, "parse", fake_parse)
-
-    entries = news.fetch_feed("http://feed")
-
-    assert len(entries) == 1
-    assert observed["during"] == config.NEWS_SOCKET_TIMEOUT_SECONDS  # set during parse
-    assert socket.getdefaulttimeout() is None                        # restored after
+    def raise_for_status(self):
+        pass
 
 
-def test_fetch_feed_restores_socket_timeout_even_on_exception(monkeypatch):
-    socket.setdefaulttimeout(None)
+def test_fetch_feed_request_failure_returns_empty_and_logs(monkeypatch, caplog):
+    def boom(url, timeout=None):
+        raise RuntimeError("connection reset")
 
-    def boom(url):
-        raise RuntimeError("network exploded")
+    monkeypatch.setattr(news.requests, "get", boom)
 
-    monkeypatch.setattr(news.feedparser, "parse", boom)
-
-    entries = news.fetch_feed("http://feed")
+    with caplog.at_level(logging.ERROR):
+        entries = news.fetch_feed("http://feed")
 
     assert entries == []
-    assert socket.getdefaulttimeout() is None  # restored despite the exception
+    assert "request failed" in caplog.text
+
+
+def test_fetch_feed_parses_canned_rss_bytes(monkeypatch):
+    rss = (
+        b'<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
+        b"<item><title>Gold rallies to record</title>"
+        b"<link>http://tst-news/a</link>"
+        b"<description>gold up on Fed</description></item>"
+        b"</channel></rss>"
+    )
+    monkeypatch.setattr(news.requests, "get", lambda url, timeout=None: _FakeResp(content=rss))
+
+    entries = news.fetch_feed("http://feed")  # real feedparser runs on the mocked bytes
+
+    assert len(entries) == 1
+    assert entries[0].title == "Gold rallies to record"
+    assert entries[0].link == "http://tst-news/a"
 
 
 def test_fetch_feed_logs_bozo_feed_with_zero_entries(monkeypatch, caplog):
-    # feedparser never raises -- a TLS/network failure comes back as bozo=True
-    # with 0 entries. That external failure must be LOGGED (INVARIANT 6), not
-    # silently treated as "no news".
-    socket.setdefaulttimeout(None)
+    # The feed downloads but is unparseable -> feedparser returns bozo=True
+    # with 0 entries. That must be LOGGED (INVARIANT 6), not silently treated
+    # as "no news".
+    monkeypatch.setattr(news.requests, "get", lambda url, timeout=None: _FakeResp(content=b"garbage"))
     monkeypatch.setattr(
         news.feedparser, "parse",
-        lambda url: SimpleNamespace(entries=[], bozo=True, bozo_exception=OSError("ssl verify failed")),
+        lambda content: SimpleNamespace(entries=[], bozo=True, bozo_exception=OSError("bad xml")),
     )
 
     with caplog.at_level(logging.ERROR):
