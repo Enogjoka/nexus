@@ -12,3 +12,4 @@ openpyxl
 xlrd
 feedparser
 hmmlearn
+scipy

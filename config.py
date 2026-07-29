@@ -244,6 +244,13 @@ REGIME_TO_VALIDATOR = {
     "YIELDS_RISING": None,
 }
 
+# LEARNING LOOP (fusion/learning_loop.py) — the system studying itself.
+LEARN_MIN_SAMPLES = 10        # terminal signals required before ranking any dim
+LEARN_NIGHTLY_UTC_HOUR = 2    # nightly job runs at 02:00 UTC
+LEARN_WEEKLY_DAY = 6          # 6 = Sunday (datetime.weekday(): Mon=0)
+LEARN_REPORT_WINDOW_DAYS = 7  # lookback for the weekly report
+REPORTS_DIR = "./reports"
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")

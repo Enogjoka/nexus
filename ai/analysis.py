@@ -343,6 +343,7 @@ def _build_validator_ctx(state: dict, utc_now: datetime) -> dict:
         "rsi": {"h1": _ind("1h", "rsi14"), "h4": _ind("4h", "rsi14")},
         "regime": {"h4": _regime("4h"), "d1": _regime("1d")},
         "upcoming_events": state.get("upcoming_events"),
+        "macro_regime": state.get("macro_regime"),
         # Same label the signals row is written under (config.YF_SYMBOL), so one
         # cycle's validator_log rows and its signal share a symbol and can be
         # joined — never the validator's internal "XAUUSD" default.
@@ -499,6 +500,22 @@ def run_analysis_cycle(state: dict, utc_now: datetime) -> dict:
     except Exception:
         logger.error("run_analysis_cycle: persist failed; outcome=PERSIST_FAILED", exc_info=True)
         return {"outcome": "PERSIST_FAILED"}
+
+    # Back-link the signal to the world-state it was born into (Task 11's
+    # deferred wiring). Best-effort by design: RAG memory is an enrichment,
+    # never a precondition, so a failure here must not unmake a signal that is
+    # already durably persisted.
+    try:
+        from fusion.rag import link_latest  # imported here to keep ai/ free of a module-level fusion dep
+
+        with database.get_conn() as link_conn:
+            link_latest(link_conn, signal_id)
+    except Exception:
+        logger.warning(
+            "run_analysis_cycle: rag.link_latest failed for signal %s; signal stands unlinked",
+            signal_id,
+            exc_info=True,
+        )
 
     logger.info("run_analysis_cycle: outcome=SIGNAL_PERSISTED id=%s lots=%s", signal_id, lots)
     return {
