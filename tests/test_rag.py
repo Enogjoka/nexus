@@ -173,9 +173,9 @@ def test_embedding_similarity_range_is_compressed_by_construction():
     """
     Documents a real property of this embedding: every dim is non-negative
     (values in [0,1], presence masks 1.0 when data is present), so cosine can
-    never approach 0 between two complete rows. Measured bounds below explain
-    why RAG_MIN_SIM is a moderate bar rather than a strict one -- anyone
-    retuning it needs these numbers.
+    never approach 0 between two complete rows. These are the measured
+    landmarks RAG_MIN_SIM is calibrated against -- anyone retuning it needs
+    exactly these numbers.
     """
     low = rag.vectorize(extreme_row("low"))
     high = rag.vectorize(extreme_row("high"))
@@ -187,13 +187,17 @@ def test_embedding_similarity_range_is_compressed_by_construction():
     assert rag.cosine_similarity(low, low) == pytest.approx(1.0)
     # Maximally-opposed COMPLETE states bottom out near 0.65, not 0.
     assert 0.60 < rag.cosine_similarity(low, high) < 0.70
+    # A merely-DIFFERENT state (mid-range vs one extreme) sits near 0.88.
+    assert 0.85 < rag.cosine_similarity(mid, high) < 0.90
     # An all-missing row is the furthest thing from a complete one (~0.40).
     assert 0.35 < rag.cosine_similarity(mid, all_missing) < 0.45
-    # The floor filters maximally-opposed states...
+
+    # RAG_MIN_SIM=0.92 sits ABOVE the "merely different" landmark, so both
+    # opposed AND merely-different states are excluded; only genuinely close
+    # precedents recall. (At the previous 0.75 the middle case slipped through.)
     assert rag.cosine_similarity(low, high) < config.RAG_MIN_SIM
-    # ...but a merely-different state (mid vs one extreme) still clears it,
-    # which is the practical meaning of RAG_MIN_SIM=0.75 on this geometry.
-    assert rag.cosine_similarity(mid, high) > config.RAG_MIN_SIM
+    assert rag.cosine_similarity(mid, high) < config.RAG_MIN_SIM
+    assert rag.cosine_similarity(low, low) > config.RAG_MIN_SIM
 
 
 def test_cosine_similarity_degenerate_inputs_are_zero():
@@ -251,26 +255,31 @@ def test_recall_returns_empty_below_min_samples():
 
 @requires_db
 def test_recall_filters_by_similarity_floor_and_ranks_by_similarity():
-    # The query is one extreme; the outlier is its exact opposite. Because the
-    # embedding is all-non-negative (values in [0,1] plus presence masks that
-    # are 1.0 whenever data is present), cosine lives in roughly [0.40, 1.0],
-    # so only a MAXIMALLY-opposed state (~0.65) falls below the 0.75 floor.
+    # The query is one extreme. TWO kinds of outlier must be excluded at
+    # RAG_MIN_SIM=0.92: the exact opposite (~0.65) and a merely-DIFFERENT
+    # mid-range state (~0.88) that the previous 0.75 floor would have admitted.
     target = rag.vectorize(extreme_row("low"))
-    dissimilar = rag.vectorize(extreme_row("high"))
-    assert rag.cosine_similarity(target, dissimilar) < config.RAG_MIN_SIM
+    opposed = rag.vectorize(extreme_row("high"))
+    merely_different = rag.vectorize(make_sv_row())
+    assert rag.cosine_similarity(target, opposed) < config.RAG_MIN_SIM
+    assert rag.cosine_similarity(target, merely_different) < config.RAG_MIN_SIM
 
     with database.get_conn() as conn:
         for offset in range(3):  # 3 near-identical precedents -> clears the guard
             sv_id = _insert_sv(conn, _FUTURE + timedelta(hours=offset), embedding=target)
             _insert_signal(conn, _FUTURE + timedelta(hours=offset), sv_id=sv_id, outcome_r=2.0)
-        far_id = _insert_sv(conn, _FUTURE + timedelta(hours=9), embedding=dissimilar)
-        _insert_signal(conn, _FUTURE + timedelta(hours=9), sv_id=far_id, outcome_r=-1.0)
+        opposed_id = _insert_sv(conn, _FUTURE + timedelta(hours=9), embedding=opposed)
+        _insert_signal(conn, _FUTURE + timedelta(hours=9), sv_id=opposed_id, outcome_r=-1.0)
+        different_id = _insert_sv(conn, _FUTURE + timedelta(hours=10), embedding=merely_different)
+        _insert_signal(conn, _FUTURE + timedelta(hours=10), sv_id=different_id, outcome_r=-1.0)
 
         results = rag.recall(conn, target)
 
-    assert len(results) == 3
+    assert len(results) == 3  # only the near-identical precedents survive
     assert all(item["similarity"] >= config.RAG_MIN_SIM for item in results)
-    assert far_id not in [item["state_vector_id"] for item in results]
+    recalled_ids = [item["state_vector_id"] for item in results]
+    assert opposed_id not in recalled_ids
+    assert different_id not in recalled_ids
     # sorted most-similar first
     assert results == sorted(results, key=lambda i: i["similarity"], reverse=True)
 

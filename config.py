@@ -212,7 +212,18 @@ RAG_CATEGORICAL_VALUES = {
 }
 RAG_K = 5
 RAG_MIN_SAMPLES = 3          # fewer comparable precedents than this -> no recall at all
-RAG_MIN_SIM = 0.75           # cosine floor for "comparable"
+# Cosine floor for "comparable". Because every dim is non-negative (values in
+# [0,1] plus presence masks), similarity is compressed into roughly [0.40, 1.00]
+# rather than spanning [0,1]. Measured landmarks on this embedding:
+#     1.000  identical states
+#    ~0.880  a merely DIFFERENT state (e.g. mid-range vs one extreme)
+#     0.647  maximally-opposed complete states
+#     0.402  a complete state vs an all-missing one
+# 0.92 therefore sits above "merely different" and admits only genuinely close
+# precedents. PROVISIONAL: this is a geometric argument, not an empirical one —
+# re-tune it against real outcome data once enough resolved signals exist for
+# recall quality to be measured rather than reasoned about.
+RAG_MIN_SIM = 0.92
 RAG_LINK_WINDOW_MINUTES = 90  # how far back a signal may reach for its state vector
 RAG_WILSON_Z = 1.96          # 95% confidence
 

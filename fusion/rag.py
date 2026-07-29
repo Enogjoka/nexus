@@ -284,7 +284,6 @@ def backfill(conn) -> Dict[str, int]:
 
     return {
         "embedded": embedded,
-        "already_embedded": 0,
         "linked": linked,
         "unlinkable": len(unlinked) - linked,
     }
