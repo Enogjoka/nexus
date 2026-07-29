@@ -235,6 +235,50 @@ def detect_session(utc_now: datetime) -> str:
     return "OFF"
 
 
+# Running session high/low. Reset when the session label flips; extended by
+# each cycle's H1 bar otherwise. run_cycle is the only writer and the data
+# agent loop is single-threaded, so a plain module dict is sufficient.
+_session_hilo: Dict[str, Any] = {"session": None, "high": None, "low": None}
+
+
+def update_session_hilo(session: str, high: float, low: float) -> Dict[str, Optional[float]]:
+    """
+    Extend (or reset) the running session high/low and publish it to
+    AppState. Resets whenever `session` differs from the tracked label,
+    otherwise widens the extremes with this cycle's H1 bar. Non-finite
+    inputs are ignored rather than recorded.
+
+    Published under BOTH keys, deliberately:
+      * "session_hilo" — the descriptive key this task's readers use
+        (fusion/state_vector.py).
+      * "session" — the exact shape ai/price_resolver.build_anchor_map (an
+        UNTOUCHABLE) already reads: state["session"] = {"high": float,
+        "low": float}. Mirroring here is what finally lights up the
+        SESSION_HIGH / SESSION_LOW anchors, dark since Task 2.
+    """
+    def _finite(value) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and bool(np.isfinite(value))
+        )
+
+    if not _finite(high) or not _finite(low):
+        logger.warning("update_session_hilo: non-finite H1 high/low (%r, %r); ignoring", high, low)
+        return {"high": _session_hilo["high"], "low": _session_hilo["low"]}
+
+    if session != _session_hilo["session"]:
+        _session_hilo.update({"session": session, "high": float(high), "low": float(low)})
+    else:
+        _session_hilo["high"] = max(_session_hilo["high"], float(high))
+        _session_hilo["low"] = min(_session_hilo["low"], float(low))
+
+    hilo = {"high": _session_hilo["high"], "low": _session_hilo["low"]}
+    STATE.update_market_data("session_hilo", dict(hilo))
+    STATE.update_market_data("session", dict(hilo))
+    return hilo
+
+
 def fetch_dxy_trend() -> Optional[Dict[str, Any]]:
     """
     Fetch DXY (config.DXY_SYMBOL) H1 close plus a simple 5-bar trend
@@ -351,6 +395,7 @@ def run_cycle() -> Dict[str, Any]:
     session = detect_session(now)
 
     summary: Dict[str, Any] = {"generated_at": now, "session": session, "timeframes": {}, "dxy": None}
+    h1_bar: Optional[Dict[str, float]] = None  # this cycle's H1 high/low, for session tracking
 
     for timeframe in config.TIMEFRAMES:
         lookback = config.CANDLE_LOOKBACK.get(timeframe, 300)
@@ -389,6 +434,12 @@ def run_cycle() -> Dict[str, Any]:
         }
         STATE.update_market_data(timeframe, tf_state)
         summary["timeframes"][timeframe] = tf_state
+
+        if timeframe == "1h":
+            h1_bar = {"high": float(last_row["high"]), "low": float(last_row["low"])}
+
+    if h1_bar is not None:
+        summary["session_hilo"] = update_session_hilo(session, h1_bar["high"], h1_bar["low"])
 
     dxy = fetch_dxy_trend()
     if dxy is not None:

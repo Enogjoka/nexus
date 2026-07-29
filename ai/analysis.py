@@ -86,6 +86,8 @@ def build_prompt(state: dict) -> str:
 
     h1, h4, d1 = tf("1h"), tf("4h"), tf("1d")
     dxy = state.get("dxy") if isinstance(state.get("dxy"), dict) else {}
+    macro = tf("macro")
+    positioning = tf("positioning")
     session = state.get("session")
     session_label = session if isinstance(session, str) else "UNKNOWN"
 
@@ -116,6 +118,15 @@ def build_prompt(state: dict) -> str:
         "## GOLD DRIVERS",
         f"DXY: {_fmt(dxy.get('close'), 3)} trend={dxy.get('trend', 'n/a')} "
         "(DXY is inversely correlated with gold)",
+        "",
+        "## MACRO & POSITIONING",
+        f"Real yield (10y TIPS): {_fmt(macro.get('real_yield'), 4)}  "
+        f"5d change: {_fmt(macro.get('real_yield_5d_delta'), 4)}",
+        f"2s10s curve: {_fmt(macro.get('curve_2s10s'), 4)}",
+        f"DXY: {_fmt(dxy.get('close'), 3)} trend={dxy.get('trend', 'n/a')}",
+        f"COT managed-money net percentile (3y): {_fmt(positioning.get('cot_mm_net_pctile'))}",
+        f"COMEX registered coverage: {_fmt(positioning.get('comex_coverage'), 4)}",
+        f"News heat (0-1): {_fmt(state.get('news_heat'), 4)}",
         "",
         "## REGIME",
         f"H1={h1.get('regime', 'n/a')}  H4={h4.get('regime', 'n/a')}  D1={d1.get('regime', 'n/a')}",

@@ -87,14 +87,16 @@ ANALYSIS_MODEL = "claude-fable-5"
 ANALYSIS_MAX_TOKENS = 1500
 ANALYSIS_TIMEOUT_SECONDS = 60
 ANALYSIS_MIN_INTERVAL_MINUTES = 30
-# Exactly the anchors that build_anchor_map() can currently resolve. SESSION_HIGH
-# and SESSION_LOW are deliberately withheld until the session-level producer task
-# lands — offering an anchor the resolver cannot fill would only ever WAIT.
+# Exactly the anchors that build_anchor_map() can currently resolve. As of
+# Task 10 that includes SESSION_HIGH/SESSION_LOW: data/gold_agent.py now tracks
+# session high/low into AppState, so the resolver can finally fill them (they
+# were withheld through Tasks 5-9 precisely because it could not).
 OFFERED_ANCHORS = [
     "CURRENT_BID", "CURRENT_ASK", "CURRENT_MID",
     "H1_EMA20", "H1_EMA50", "H1_BB_UPPER", "H1_BB_LOWER", "H1_BB_MID",
     "H4_EMA20", "H4_EMA50", "H4_SWING_HIGH", "H4_SWING_LOW",
     "D1_EMA20", "D1_EMA50", "D1_SWING_HIGH", "D1_SWING_LOW",
+    "SESSION_HIGH", "SESSION_LOW",
 ]
 # Estimated USD cost per 1M tokens, used ONLY to accumulate the daily budget
 # guard (STATE.budget_spent_today) — approximate, not a billing source of truth.

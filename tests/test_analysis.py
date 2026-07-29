@@ -158,10 +158,13 @@ def test_build_prompt_offers_exactly_the_16_anchors():
     assert len(EXPECTED_ANCHORS) == 16
 
 
-def test_build_prompt_never_mentions_session_anchors():
+def test_build_prompt_offers_session_anchors():
+    # Task 10 lit these up: data/gold_agent.py now tracks session high/low into
+    # AppState, so the resolver can fill them and the prompt may offer them.
+    # (Through Tasks 5-9 this test asserted the opposite, for the same reason.)
     prompt = build_prompt(make_state())
-    assert "SESSION_HIGH" not in prompt
-    assert "SESSION_LOW" not in prompt
+    assert "SESSION_HIGH" in prompt
+    assert "SESSION_LOW" in prompt
 
 
 def test_build_prompt_survives_empty_state():
