@@ -181,6 +181,58 @@ GOLD_GEOPOLITICAL = [
     "safe-haven", "central bank buying", "de-dollarization", "ceasefire",
 ]
 
+# RAG (fusion/rag.py) — recall similar past world-states, outcome-weighted.
+# Every numeric dim is min-max normalized into [0,1] against a FIXED range, so
+# a vector embedded today stays comparable to one embedded a year ago. Ranges
+# are deliberately generous: values outside them clamp rather than distort.
+RAG_DIM_RANGES = {
+    "rsi_h1": (0.0, 100.0),
+    "rsi_h4": (0.0, 100.0),
+    "rsi_d1": (0.0, 100.0),
+    "bb_position_h1": (0.0, 100.0),
+    "atr_h1": (0.0, 50.0),
+    "atr_h4": (0.0, 100.0),
+    "real_yield": (-2.0, 4.0),
+    "real_yield_5d_delta": (-1.0, 1.0),
+    "curve_2s10s": (-2.0, 3.0),
+    "breakeven_10y": (0.0, 5.0),
+    "dxy": (90.0, 120.0),
+    "cot_mm_net_pctile": (0.0, 100.0),
+    "comex_coverage": (0.0, 50.0),
+    "news_heat": (0.0, 1.0),
+    "minutes_to_next_high_event": (0.0, 120.0),
+    "fix_window": (0.0, 1.0),
+}
+# One-hot dims. An all-zero block encodes "absent" unambiguously, so these need
+# no separate presence mask (unlike the numerics, where a neutral 0.5 would be
+# indistinguishable from a genuine mid-range reading).
+RAG_CATEGORICAL_VALUES = {
+    "regime_h4": ["TREND_UP", "TREND_DOWN", "RANGE", "VOLATILE"],
+    "session": ["ASIA", "LONDON", "OVERLAP", "NY", "OFF"],
+}
+RAG_K = 5
+RAG_MIN_SAMPLES = 3          # fewer comparable precedents than this -> no recall at all
+RAG_MIN_SIM = 0.75           # cosine floor for "comparable"
+RAG_LINK_WINDOW_MINUTES = 90  # how far back a signal may reach for its state vector
+RAG_WILSON_Z = 1.96          # 95% confidence
+
+# REGIME (fusion/regime.py) — an HMM over the MACRO state, not price.
+REGIME_N_STATES = 4
+REGIME_MIN_ROWS = 168        # 1 week of hourly rows; below this we refuse to train
+REGIME_RETRAIN_HOURS = 24
+REGIME_FEATURES = ["real_yield_5d_delta", "dxy_change", "curve_2s10s", "news_heat"]
+REGIME_LABELS = ["YIELDS_FALLING", "NEUTRAL", "YIELDS_RISING", "STRESS"]
+# Mapping is CONFIG, not code: risk/validator.py RULE 5 owns the vocabulary it
+# reacts to ("RISK_OFF") and is UNTOUCHABLE. Regime labels are this module's own
+# vocabulary; this dict is the only place the two are bridged. A None means the
+# validator sees no macro_regime and RULE 5 skips.
+REGIME_TO_VALIDATOR = {
+    "STRESS": "RISK_OFF",
+    "YIELDS_FALLING": None,
+    "NEUTRAL": None,
+    "YIELDS_RISING": None,
+}
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")

@@ -11,3 +11,4 @@ requests
 openpyxl
 xlrd
 feedparser
+hmmlearn
