@@ -89,6 +89,18 @@ def _ind(state: dict, timeframe: str, key: str):
     return indicators.get(key) if isinstance(indicators, dict) else None
 
 
+def session_label(state: dict, now_utc: datetime) -> str:
+    """
+    The data agent's published session label when it has one, else derived
+    from the clock. data/gold_agent.py owns the authoritative session
+    boundaries and publishes them under "session_label" (the "session" key
+    belongs to the resolver's {high, low} contract); deriving from the clock
+    here is only the fallback for a process with no data agent running.
+    """
+    label = _str(state.get("session_label"))
+    return label if label else detect_session(now_utc)
+
+
 def in_fix_window(now_utc: datetime) -> bool:
     """
     True when now_utc falls within config.FIX_BLOCK_MINUTES BEFORE either
@@ -153,7 +165,7 @@ def assemble(state: dict, conn, now_utc: datetime) -> Dict[str, Any]:
         "regime_h1": _str(_dict(state, "1h").get("regime")),
         "regime_h4": _str(_dict(state, "4h").get("regime")),
         "regime_d1": _str(_dict(state, "1d").get("regime")),
-        "session": detect_session(now_utc),
+        "session": session_label(state, now_utc),
         "session_high": _num(session_hilo.get("high")),
         "session_low": _num(session_hilo.get("low")),
         # ---- L1 macro

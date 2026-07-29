@@ -88,7 +88,7 @@ def build_prompt(state: dict) -> str:
     dxy = state.get("dxy") if isinstance(state.get("dxy"), dict) else {}
     macro = tf("macro")
     positioning = tf("positioning")
-    session = state.get("session")
+    session = state.get("session_label")  # "session" holds the resolver's {high, low}
     session_label = session if isinstance(session, str) else "UNKNOWN"
 
     lines = [

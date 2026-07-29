@@ -393,6 +393,10 @@ def run_cycle() -> Dict[str, Any]:
     """
     now = datetime.now(timezone.utc)
     session = detect_session(now)
+    # The session LABEL gets its own key. state["session"] is NOT available for
+    # it: that key belongs to ai/price_resolver.build_anchor_map's
+    # {"high", "low"} contract (an UNTOUCHABLE) — see update_session_hilo.
+    STATE.update_market_data("session_label", session)
 
     summary: Dict[str, Any] = {"generated_at": now, "session": session, "timeframes": {}, "dxy": None}
     h1_bar: Optional[Dict[str, float]] = None  # this cycle's H1 high/low, for session tracking

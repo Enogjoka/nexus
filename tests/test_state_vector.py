@@ -36,7 +36,7 @@ def _cleanup_rows():
 def _isolate_state():
     """Save/restore the AppState keys these tests write, and reset the
     module-local session tracker so one test cannot leak into another."""
-    touched = ("session_hilo", "session", "state_vector")
+    touched = ("session_hilo", "session", "session_label", "state_vector")
     saved = {key: STATE.market_data.get(key) for key in touched}
     gold_agent._session_hilo.update({"session": None, "high": None, "low": None})
     yield
@@ -285,6 +285,36 @@ def test_resolver_now_resolves_session_anchors_from_gold_agent_shape():
     assert anchor_map[Anchor.SESSION_LOW] == 4070.0
 
 
+def test_assemble_prefers_state_session_label_over_the_clock():
+    # The data agent owns the authoritative session boundaries; when it has
+    # published a label, the clock-derived fallback must not override it.
+    state = make_full_state()
+    state["session_label"] = "ASIA"                 # data agent says ASIA...
+    vector = sv.assemble(state, None, _FUTURE)      # ...while 08:00 UTC reads LONDON
+    assert vector["session"] == "ASIA"
+
+
+def test_assemble_falls_back_to_clock_without_a_session_label():
+    # No data agent in this process -> derive from the clock rather than NULL.
+    state = make_full_state()
+    state.pop("session_label", None)
+    assert sv.assemble(state, None, _FUTURE)["session"] == "LONDON"
+
+
+def test_session_label_and_resolver_contract_coexist():
+    """The label and the resolver's {high, low} live under DIFFERENT keys, so
+    populating one can never clobber the other."""
+    gold_agent.update_session_hilo("LONDON", 4130.0, 4070.0)
+    STATE.update_market_data("session_label", "LONDON")
+
+    # resolver contract intact...
+    anchor_map = build_anchor_map(STATE.market_data)
+    assert anchor_map[Anchor.SESSION_HIGH] == 4130.0
+    # ...and the label is readable alongside it
+    assert STATE.get_market_data("session_label") == "LONDON"
+    assert "Session: LONDON" in build_prompt(STATE.market_data)
+
+
 def test_state_vector_reads_the_session_hilo_gold_agent_writes():
     gold_agent.update_session_hilo("LONDON", 4130.0, 4070.0)
     vector = sv.assemble(STATE.market_data, None, _FUTURE)
@@ -295,6 +325,19 @@ def test_state_vector_reads_the_session_hilo_gold_agent_writes():
 # --------------------------------------------------------------------------
 # prompt: MACRO & POSITIONING section
 # --------------------------------------------------------------------------
+
+
+def test_prompt_renders_session_label_from_its_own_key():
+    state = make_full_state()
+    state["session_label"] = "OVERLAP"
+    state["session"] = {"high": 4130.0, "low": 4070.0}  # resolver's contract, not a label
+    assert "Session: OVERLAP" in build_prompt(state)
+
+
+def test_prompt_session_is_unknown_without_a_label():
+    state = make_full_state()
+    state["session"] = {"high": 4130.0, "low": 4070.0}  # dict must never render as a label
+    assert "Session: UNKNOWN" in build_prompt(state)
 
 
 def test_prompt_renders_macro_section_with_values():
