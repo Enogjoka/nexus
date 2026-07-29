@@ -251,6 +251,11 @@ LEARN_WEEKLY_DAY = 6          # 6 = Sunday (datetime.weekday(): Mon=0)
 LEARN_REPORT_WINDOW_DAYS = 7  # lookback for the weekly report
 REPORTS_DIR = "./reports"
 
+# BACKEND SUPERVISOR (backend.py) — the process that runs every agent loop.
+SUPERVISOR_POLL_SECONDS = 30   # thread-liveness poll interval
+MAX_RESTARTS_PER_HOUR = 4      # per agent; on the next failure the supervisor gives up
+HEARTBEAT_TELEGRAM_HOURS = 12  # /status-style summary cadence; 0 disables
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
