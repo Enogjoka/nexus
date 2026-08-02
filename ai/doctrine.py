@@ -488,14 +488,30 @@ def _classify_flat(raw: str, doctrine: Doctrine) -> str:
     Distinguish "Fable deliberately stood the desk down" from "we could not
     understand Fable". Both are FLAT; only one is the model's own judgement,
     and conflating them would hide a broken prompt behind a calm-looking row.
+
+    The test is the WHOLE contract, not the bias field alone: the raw response
+    must validate as a Doctrine in its own right AND come out FLAT. A response
+    claiming bias=FLAT while enabling pods, allowing swing signals, omitting
+    no_trade_reason or carrying an extra key did not stand us down — we
+    rejected it and substituted our own posture. Crediting that to FABLE would
+    record a model failure as a model decision, which is exactly the blindness
+    this column exists to prevent.
+
+    The re-parse is deterministic: the adopted doctrine's ts is the same value
+    parse_doctrine injected, so this reproduces that parse rather than a new
+    one, and cannot disagree with it.
     """
     try:
         data = json.loads(_defence(raw))
-        if isinstance(data, dict) and str(data.get("bias", "")).upper() == "FLAT":
-            return SOURCE_FABLE
+        if not isinstance(data, dict):
+            return SOURCE_PARSE_FALLBACK
+        data["ts"] = doctrine.ts.isoformat()
+        revalidated = Doctrine.model_validate_json(json.dumps(data))
     except Exception:
-        pass
-    return SOURCE_PARSE_FALLBACK
+        # Did not validate -> the FLAT we adopted is ours, not Fable's.
+        return SOURCE_PARSE_FALLBACK
+
+    return SOURCE_FABLE if revalidated.bias == "FLAT" else SOURCE_PARSE_FALLBACK
 
 
 # ==========================================================================

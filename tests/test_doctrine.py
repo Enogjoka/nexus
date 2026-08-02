@@ -386,6 +386,74 @@ def test_deliberate_flat_from_the_model_is_recorded_as_fable(monkeypatch):
     assert (bias, source) == ("FLAT", doc.SOURCE_FABLE)
 
 
+# A raw response may SAY bias=FLAT and still be something we rejected. Only a
+# response that validates as a Doctrine in its own right counts as Fable
+# standing the desk down; everything here is our fallback wearing its label.
+MALFORMED_FLAT_CASES = [
+    ("pods enabled", valid_payload(bias="FLAT", enabled_pods=["S1_FIXFADE"], swing_signals_allowed=False, no_trade_reason="stand down")),
+    ("swing allowed", valid_payload(bias="FLAT", enabled_pods=[], swing_signals_allowed=True, no_trade_reason="stand down")),
+    ("missing reason", valid_payload(bias="FLAT", enabled_pods=[], swing_signals_allowed=False, no_trade_reason=None)),
+    ("extra key", valid_payload(bias="FLAT", enabled_pods=[], swing_signals_allowed=False, no_trade_reason="stand down", entry_price=4000.0)),
+    ("conviction out of range", valid_payload(bias="FLAT", enabled_pods=[], swing_signals_allowed=False, no_trade_reason="stand down", conviction=99)),
+    ("horizon out of range", valid_payload(bias="FLAT", enabled_pods=[], swing_signals_allowed=False, no_trade_reason="stand down", review_horizon_min=5)),
+]
+
+
+@pytest.mark.parametrize(
+    "label,payload", MALFORMED_FLAT_CASES, ids=[c[0] for c in MALFORMED_FLAT_CASES]
+)
+def test_a_flat_we_rejected_is_never_credited_to_fable(monkeypatch, label, payload):
+    """
+    We rejected it, so Fable did not stand us down. Recording these as FABLE
+    would file a model failure as a model decision and hide a broken prompt
+    behind a calm-looking row.
+    """
+    monkeypatch.setattr(doc, "_get_client", lambda: FakeClient(text=json.dumps(payload)))
+
+    result = doc.issue_doctrine({}, NOW)
+
+    assert result.bias == "FLAT"
+    assert result.no_trade_reason != payload.get("no_trade_reason"), (
+        "the adopted posture must be OUR fallback, not the model's text"
+    )
+
+    bias, source = database.fetch(
+        "SELECT bias, source FROM doctrines ORDER BY id DESC LIMIT 1"
+    )[0]
+    assert (bias, source) == ("FLAT", doc.SOURCE_PARSE_FALLBACK)
+
+
+def test_classify_flat_requires_full_validation_not_just_the_bias_field():
+    """Unit-level statement of the same rule, without the DB round trip."""
+    adopted = doc.FLAT_FALLBACK("ours", doc.SOURCE_PARSE_FALLBACK, NOW)
+
+    valid_flat = json.dumps(
+        valid_payload(
+            bias="FLAT",
+            conviction=0,
+            risk_multiplier=0.0,
+            enabled_pods=[],
+            swing_signals_allowed=False,
+            no_trade_reason="genuinely standing down",
+        )
+    )
+    assert doc._classify_flat(valid_flat, adopted) == doc.SOURCE_FABLE
+
+    says_flat_but_armed = json.dumps(
+        valid_payload(bias="FLAT", enabled_pods=["S1_FIXFADE"], no_trade_reason="x")
+    )
+    assert doc._classify_flat(says_flat_but_armed, adopted) == doc.SOURCE_PARSE_FALLBACK
+
+    for junk in ["not json", "[1,2,3]", "", '{"bias": "FLAT"}']:
+        assert doc._classify_flat(junk, adopted) == doc.SOURCE_PARSE_FALLBACK
+
+
+def test_classify_flat_rejects_a_validating_non_flat_response():
+    """Defensive: a valid LONG_ONLY reaching this path is not a FLAT source."""
+    adopted = doc.FLAT_FALLBACK("ours", doc.SOURCE_PARSE_FALLBACK, NOW)
+    assert doc._classify_flat(json.dumps(valid_payload()), adopted) == doc.SOURCE_PARSE_FALLBACK
+
+
 def test_issue_doctrine_accumulates_cost(monkeypatch):
     monkeypatch.setattr(doc, "_get_client", lambda: FakeClient(text=json.dumps(valid_payload())))
     STATE.budget_spent_today = 0.0
