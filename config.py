@@ -311,6 +311,20 @@ STALE_TICK_SECONDS = 30       # a quote older than this is not a price, it is a 
 RECONCILE_INTERVAL_SECONDS = 30
 KERNEL_EQUITY_FLOOR = 100.0   # below this something is deeply wrong
 
+# DOCTRINE (ai/doctrine.py) — Ring 2's output cage.
+# The head-of-desk emits a Doctrine (enums + bounded floats), never an order.
+# Every failure path degrades to FLAT: silence is safe, guessing is not.
+POD_NAMES = ["S1_FIXFADE", "S2_VWAPSNAP", "S3_BASIS", "S4_NEWSBURST"]
+DOCTRINE_MODEL = "claude-fable-5"
+DOCTRINE_MAX_TOKENS = 1000
+DOCTRINE_TIMEOUT_SECONDS = 60
+# Cadence follows the clock: pods only matter when the book is active.
+DOCTRINE_CADENCE_ACTIVE_MIN = 15   # LONDON / OVERLAP / NY
+DOCTRINE_CADENCE_QUIET_MIN = 60    # ASIA / OFF
+# Sonnet scores 0-1 whether a state change is worth waking Fable for.
+TRIAGE_THRESHOLD = 0.5
+TRIAGE_MAX_TOKENS = 200
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
