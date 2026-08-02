@@ -298,6 +298,19 @@ STAGE_POLICY = {
     },
 }
 
+# KERNEL (risk/kernel.py) — Ring 0, the sovereign risk kernel.
+# These are hard limits, not preferences. Every one of them only ever DENIES;
+# no value here can cause an order to be permitted that would otherwise be
+# refused. Loosening a number here loosens the last line of defence — the
+# kernel is the ring that assumes everything upstream of it is already wrong.
+DAILY_LOSS_CAP_PCT = 1.5      # % of day-start equity; breach halts until UTC midnight
+MAX_DRAWDOWN_PCT = 5.0        # % below observed peak equity; breach demotes a rung
+SPREAD_CEILING_USD = 0.45     # XAUUSD spread above which no entry is worth taking
+SLIPPAGE_ANOMALY_MULT = 2.0   # observed slippage over expected before it is anomalous
+STALE_TICK_SECONDS = 30       # a quote older than this is not a price, it is a memory
+RECONCILE_INTERVAL_SECONDS = 30
+KERNEL_EQUITY_FLOOR = 100.0   # below this something is deeply wrong
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")

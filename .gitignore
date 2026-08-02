@@ -9,3 +9,13 @@ venv/
 # tracked so the directory exists on a fresh clone.
 reports/*.json
 reports/*.md
+
+# Operational flag files. These are RUNTIME STATE, never configuration, and
+# must never be committed: a DEMOTED or KILL file arriving via git would
+# silently change how a fresh checkout behaves. Both are created and cleared
+# by humans or the kernel on the machine that owns them.
+DEMOTED
+KILL
+# Soak-test transcript (also matched by *.log above; named explicitly so the
+# intent survives if that pattern is ever narrowed).
+soak.log

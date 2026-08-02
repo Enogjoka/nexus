@@ -22,6 +22,7 @@
 - risk/validator.py (7-rule pre-flight gate; only restricts, never loosens)
 - risk/sizing.py (pure position sizer; never rounds up, never exceeds risk budget)
 - risk/stage.py (stage ladder + demotion flag; all decisions import-time, no setter)
+- risk/kernel.py (RING 0; zero ai/ or fusion/ imports, fails closed, no resume path)
 
 ## If the spec conflicts with reality
 
