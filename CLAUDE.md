@@ -21,6 +21,7 @@
 - ai/price_resolver.py (anchor-enum contract; the AI/price wall)
 - risk/validator.py (7-rule pre-flight gate; only restricts, never loosens)
 - risk/sizing.py (pure position sizer; never rounds up, never exceeds risk budget)
+- risk/stage.py (stage ladder + demotion flag; all decisions import-time, no setter)
 
 ## If the spec conflicts with reality
 

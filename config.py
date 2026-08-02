@@ -256,6 +256,48 @@ SUPERVISOR_POLL_SECONDS = 30   # thread-liveness poll interval
 MAX_RESTARTS_PER_HOUR = 4      # per agent; on the next failure the supervisor gives up
 HEARTBEAT_TELEGRAM_HOURS = 12  # /status-style summary cadence; 0 disables
 
+# STAGE GOVERNOR (risk/stage.py) — the ladder as enforceable machinery.
+# The Stage enum and get_stage() at the top of this file are the mechanism;
+# these are the knobs the governor reads. Nothing here mutates a stage.
+#
+# A demotion is signalled by the presence of this FILE, not by a database row
+# or an env var, because a file survives a crash, is trivially auditable, and
+# can only be cleared by a human deleting it and restarting the process.
+DEMOTED_FLAG_PATH = "./DEMOTED"
+
+# Per-stage execution policy. The ladder tightens as real money appears:
+# PAPER/SHADOW are simulated so the caps are nominal; MICRO is the first stage
+# with live money and therefore the tightest caps in the table; SCALED is the
+# only stage permitted to size off the risk budget.
+# max_concurrent_positions stays 2 at every stage — correlation risk on a
+# single instrument does not care which stage you are in.
+STAGE_POLICY = {
+    "PAPER": {
+        "fill_mode": "MODELED",
+        "max_lot_per_order": 0.10,
+        "max_total_lots": 0.10,
+        "max_concurrent_positions": 2,
+    },
+    "SHADOW": {
+        "fill_mode": "SHADOW_REAL_BIDASK",
+        "max_lot_per_order": 0.10,
+        "max_total_lots": 0.10,
+        "max_concurrent_positions": 2,
+    },
+    "MICRO": {
+        "fill_mode": "LIVE_FIXED_MICRO",
+        "max_lot_per_order": 0.01,
+        "max_total_lots": 0.02,
+        "max_concurrent_positions": 2,
+    },
+    "SCALED": {
+        "fill_mode": "LIVE_RISK_SIZED",
+        "max_lot_per_order": 1.00,
+        "max_total_lots": 1.00,
+        "max_concurrent_positions": 2,
+    },
+}
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
