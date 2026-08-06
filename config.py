@@ -388,6 +388,31 @@ S2_LOTS = 0.01
 # is that no pod may present its best case as its expected case.
 EDGE_HAIRCUT = 0.5           # expected_edge = |tp-entry| * oz * lots * HAIRCUT
 
+# BASIS (sensors/basis.py) — the futures/spot spread that S3 trades.
+SPOT_SYMBOL = "XAUUSD=X"
+BASIS_POLL_MINUTES = 5
+
+# PODS.S3 — BASIS-DISLOC. Trade the reversion when the future/spot spread
+# leaves its own recent band. The band is the whole thesis, so a band built on
+# too little history is worse than no signal: S3_MIN_READINGS is the point
+# below which the pod stays silent rather than trading its own noise.
+S3_BAND_LOOKBACK = 100        # rolling readings used to build the band
+S3_BAND_SIGMA = 2.5           # dislocation = |basis - mean| > sigma * stdev
+S3_MIN_READINGS = 30          # thinner history -> pod silent
+S3_STOP_ATR_MULT = 0.7
+S3_TP_REVERT_FRACTION = 0.7   # target 70% of the way back to the band mean
+S3_LOTS = 0.01
+
+# PODS.S4 — NEWS-BURST. Enter the pullback after a high-impact USD release,
+# never into it. The arm window opens AFTER the print (S4_ARM_AFTER_MIN) so the
+# pod is never in the market for the spike itself.
+S4_ARM_AFTER_MIN = 2          # armed from T+2m ...
+S4_ARM_UNTIL_MIN = 15         # ... to T+15m after a HIGH USD release
+S4_PULLBACK_FRACTION = 0.3    # entry on a 30% retrace of the burst bar
+S4_STOP_ATR_MULT = 1.0
+S4_TP_ATR_MULT = 1.5
+S4_LOTS = 0.01
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")

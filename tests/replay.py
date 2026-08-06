@@ -336,7 +336,15 @@ def build_pod(name: str):
         from pods.s2_vwapsnap import S2VwapSnap
 
         return S2VwapSnap()
-    raise SystemExit(f"unknown pod {name!r}; expected S1 or S2")
+    if key in ("S3", "S3_BASIS"):
+        from pods.s3_basis import S3Basis
+
+        return S3Basis()
+    # S4 is deliberately absent. It is TICK-NATIVE: its burst and pullback
+    # happen inside a single H1 bar, so this harness cannot see the sequence it
+    # would be judging. Adding it here would produce a number, and that number
+    # would be quoted. See the banner in pods/s4_newsburst.py.
+    raise SystemExit(f"unknown pod {name!r}; expected S1, S2 or S3")
 
 
 def main(argv: Optional[List[str]] = None) -> None:

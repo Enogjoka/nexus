@@ -160,6 +160,44 @@ def upcoming_events(conn, now_utc: datetime) -> List[dict]:
     return result
 
 
+def recent_high_events(conn, now_utc: datetime, lookback_min: int = 20) -> List[dict]:
+    """
+    THE S4 FEED. HIGH-impact USD events ALREADY RELEASED within the last
+    `lookback_min` minutes, shaped as:
+
+        {"minutes_since": float, "name": str}
+
+    The mirror image of upcoming_events: that one looks forward and reports
+    minutes_until, this one looks back and reports minutes_since. Only events
+    strictly in the past are returned (minutes_since >= 0), so an event that
+    has not printed yet can never arm a pod.
+
+    Impact is filtered HERE rather than by the caller, unlike upcoming_events
+    which hands the validator every candidate. The difference is deliberate:
+    the validator decides for itself what is close enough to matter across all
+    impact levels, whereas "a HIGH-impact release just happened" is the entire
+    definition of the event S4 waits for — a MEDIUM print is not a weaker
+    version of it, it is a different thing.
+    """
+    since = now_utc - timedelta(minutes=lookback_min)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT event_ts, name FROM econ_events "
+            "WHERE event_ts >= %s AND event_ts <= %s AND upper(impact) = 'HIGH' "
+            "ORDER BY event_ts DESC",
+            (since, now_utc),
+        )
+        rows = cur.fetchall()
+
+    result: List[dict] = []
+    for event_ts, name in rows:
+        if event_ts.tzinfo is None:
+            event_ts = event_ts.replace(tzinfo=timezone.utc)
+        minutes_since = (now_utc - event_ts).total_seconds() / 60.0
+        result.append({"minutes_since": minutes_since, "name": name})
+    return result
+
+
 def run_calendar_cycle(now_utc: datetime) -> dict:
     """
     One fetch-persist-publish pass. Network happens OUTSIDE the DB checkout
