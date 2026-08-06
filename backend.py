@@ -50,11 +50,14 @@ import ai.doctrine
 import data.gold_agent
 import data.mt5_bridge
 import exec_.paper_engine
+import exec_.pod_agent
+import exec_.position_engine
 import exec_.router
 import fusion.learning_loop
 import fusion.regime
 import fusion.state_vector
 import ops.telegram_bot
+import sensors.basis
 import sensors.calendar_agent
 import sensors.fred
 import sensors.news
@@ -109,6 +112,12 @@ AGENTS: List[Agent] = [
     # been verified in a live run, to no benefit.
     Agent("kernel-watchdog", lambda: get_kernel().run_kernel_watchdog(), KIND_LOOP),
     Agent("doctrine", ai.doctrine.run_doctrine_agent, KIND_LOOP),
+    # Task 21: pods go live. The basis sensor feeds S3; the pod agent sweeps
+    # the pods and submits their intents; the position engine owns every
+    # router-opened position from fill to close.
+    Agent("basis", sensors.basis.run_basis_agent, KIND_LOOP),
+    Agent("pod-agent", lambda: exec_.pod_agent.run_pod_agent(get_router()), KIND_SUBSCRIBER),
+    Agent("position-engine", lambda: exec_.position_engine.run_position_engine(get_router()), KIND_SUBSCRIBER),
 ]
 
 _RESTART_WINDOW_SECONDS = 3600.0

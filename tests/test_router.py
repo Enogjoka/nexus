@@ -111,6 +111,14 @@ class SpyBridge:
         return 5000.0
 
 
+def position_row(client_order_id):
+    rows = database.fetch(
+        "SELECT state, entry_px, close_reason FROM positions WHERE client_order_id = %s",
+        (client_order_id,),
+    )
+    return rows[0] if rows else None
+
+
 def fills_row(client_order_id):
     rows = database.fetch(
         "SELECT status, kernel_reason, lots, requested_px, fill_px, slippage, fill_mode "
@@ -183,7 +191,7 @@ def test_a_duplicate_client_order_id_is_not_sent_twice():
     second = router.submit(signal)
 
     assert first["outcome"] == router_mod.SUBMITTED
-    assert second["outcome"] == router_mod.DUPLICATE
+    assert second["outcome"] == router_mod.DUPLICATE  # UNIQUE(client_order_id) in positions
     assert len(bridge.opens) == 1, "the second submit must not reach the bridge"
     assert kernel.calls == 1, "a duplicate is refused before the kernel is troubled"
 
@@ -192,19 +200,24 @@ def test_client_order_id_is_derived_from_the_signal_id():
     assert router_mod.client_order_id_for(42) == "NEXUS-42"
 
 
-def test_an_unreadable_ledger_fails_closed(monkeypatch):
-    """A database blip must not become a doubled position."""
+def test_an_unreservable_ledger_stops_the_order_dead(monkeypatch):
+    """
+    THE TASK 16 REGRESSION. The old flow read the ledger, then sent, then
+    wrote — so a write failure left a position open and unrecorded, and the
+    next submit would open a second one. Now the row is written FIRST, and a
+    ledger that cannot take it means no order at all.
+    """
 
     def unavailable(*a, **k):
         raise RuntimeError("connection refused")
 
-    monkeypatch.setattr(database, "fetch", unavailable)
+    monkeypatch.setattr(database, "get_conn", unavailable)
     bridge = SpyBridge()
 
     result = Router(bridge, SpyKernel()).submit(next_signal())
 
-    assert result["outcome"] == router_mod.DUPLICATE
-    assert bridge.opens == []
+    assert result["outcome"] == router_mod.LEDGER_UNAVAILABLE
+    assert bridge.opens == [], "no ledger, no order — the bridge is never touched"
 
 
 # ===========================================================================
@@ -434,31 +447,104 @@ def test_a_real_submit_through_the_sim_stack_fills_and_records(monkeypatch, tmp_
     assert fill_mode == "MODELED", "PAPER stage models its fills"
 
 
-def test_a_fill_that_cannot_be_recorded_is_flagged_loudly(monkeypatch, caplog):
+def test_the_filled_but_not_recorded_window_no_longer_exists():
     """
-    The position is open but the ledger does not know, so idempotency is no
-    longer protecting it. That must be impossible to miss.
+    Task 16 shipped a CRITICAL for the case where a fill landed but the ledger
+    write failed. Reserve-before-send removes the window entirely: the row is
+    committed before the bridge is called, so there is no ordering in which a
+    position exists and the ledger does not know. The warning is gone because
+    the condition is gone.
     """
-    caplog.set_level(logging.INFO, logger="exec_.router")
+    import ast
+    import inspect
 
-    def unavailable(*a, **k):
-        raise RuntimeError("disk full")
+    # String LITERALS, not raw source: a comment explaining why the warning is
+    # gone naturally contains the words it is explaining.
+    tree = ast.parse(inspect.getsource(router_mod))
+    literals = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+    assert not any("FILLED BUT NOT RECORDED" in text for text in literals)
 
-    # The ledger READ succeeds (no prior row) but the WRITE fails — the only
-    # ordering that gets a real fill past an unwritable ledger.
-    monkeypatch.setattr(database, "fetch", lambda *a, **k: [])
-    monkeypatch.setattr(database, "get_conn", unavailable)
-    bridge = SpyBridge()
 
-    result = Router(bridge, SpyKernel()).submit(next_signal())
+def test_a_position_row_is_reserved_before_the_bridge_is_touched():
+    order_of_events = []
+
+    class OrderingBridge(SpyBridge):
+        def market_open(self, *a, **k):
+            order_of_events.append("send")
+            return super().market_open(*a, **k)
+
+    signal = next_signal()
+    Router(OrderingBridge(), SpyKernel()).submit(signal)
+
+    row = position_row(f"NEXUS-{signal['id']}")
+    assert row is not None, "the reservation must exist"
+    assert order_of_events == ["send"]
+
+
+def test_a_filled_order_moves_its_row_to_open():
+    signal = next_signal()
+    result = Router(SpyBridge(), SpyKernel()).submit(signal)
 
     assert result["outcome"] == router_mod.SUBMITTED
-    assert len(bridge.opens) == 1
-    assert result["ledger_recorded"] is False
-    criticals = [r for r in caplog.records if r.levelno == logging.CRITICAL]
-    assert criticals and "FILLED BUT NOT RECORDED" in criticals[0].getMessage()
+    state, entry_px, _ = position_row(f"NEXUS-{signal['id']}")
+    assert state == router_mod.STATE_OPEN
+    assert float(entry_px) == pytest.approx(4000.25)
 
 
-def test_a_recorded_fill_reports_the_ledger_wrote():
-    result = Router(SpyBridge(), SpyKernel()).submit(next_signal())
-    assert result["ledger_recorded"] is True
+def test_a_kernel_denial_marks_the_row_failed():
+    kernel = SpyKernel(Verdict(allowed=False, breaker="SPREAD_CEILING", reason="too wide"))
+    signal = next_signal()
+
+    Router(SpyBridge(), kernel).submit(signal)
+
+    state, _, close_reason = position_row(f"NEXUS-{signal['id']}")
+    assert state == router_mod.STATE_FAILED
+    assert "SPREAD_CEILING" in close_reason
+
+
+def test_a_bridge_failure_marks_the_row_failed():
+    signal = next_signal()
+    Router(SpyBridge(results=[None, None]), SpyKernel(), retry_delay_seconds=0).submit(signal)
+
+    state, _, close_reason = position_row(f"NEXUS-{signal['id']}")
+    assert state == router_mod.STATE_FAILED
+    assert close_reason == "BRIDGE_FAILED"
+
+
+def test_a_pod_order_with_a_non_numeric_id_still_writes_its_fills_row():
+    """
+    REGRESSION (found in the Task 21 live run). Pod signal ids are strings
+    like "S1_FIXFADE-1786015714" and fills.signal_id is BIGINT, so the INSERT
+    failed and — the fills write being best-effort — the audit row vanished
+    silently for every pod trade. NULL is the honest value: a pod order has no
+    row in `signals` to point at.
+    """
+    signal = next_signal(source="POD", pod="S1_FIXFADE", expected_edge_usd=100.0)
+    signal["id"] = f"S1_FIXFADE-{os.getpid()}-{_SEQ['n']}"
+
+    result = Router(SpyBridge(), SpyKernel()).submit(signal)
+
+    assert result["outcome"] == router_mod.SUBMITTED
+    assert result["ledger_recorded"] is True, "the pod's fill must be audited"
+
+    rows = database.fetch(
+        "SELECT signal_id, status FROM fills WHERE client_order_id = %s",
+        (f"NEXUS-{signal['id']}",),
+    )
+    assert rows, "a fills row must exist for a pod order"
+    assert rows[0][0] is None, "a pod order points at no signal row"
+    assert rows[0][1] == "FILLED"
+
+
+def test_a_numeric_signal_id_is_still_recorded():
+    signal = next_signal()
+    Router(SpyBridge(), SpyKernel()).submit(signal)
+    rows = database.fetch(
+        "SELECT signal_id FROM fills WHERE client_order_id = %s",
+        (f"NEXUS-{signal['id']}",),
+    )
+    assert int(rows[0][0]) == int(signal["id"])

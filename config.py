@@ -413,6 +413,25 @@ S4_STOP_ATR_MULT = 1.0
 S4_TP_ATR_MULT = 1.5
 S4_LOTS = 0.01
 
+# POSITION ENGINE (exec_/position_engine.py) — one manager, both sources.
+POSITION_TP1_FRACTION = 0.5    # fraction of the position closed at tp1
+TRAIL_ATR_MULT_SWING = 1.0     # trail distance for swing positions, in ATR(h1)
+# The only implemented policy. A doctrine that flips against an open SWING
+# position tightens its stop to break-even rather than closing it outright:
+# the doctrine is a view, and a view that changed is a reason to stop risking
+# NEW money, not a reason to pay the spread to exit a position that may still
+# be right. Adding a value here means implementing it.
+DOCTRINE_FLIP_POLICY = "TIGHTEN_BE"
+EOW_FLAT_ENABLED = True        # flatten pods before the weekend gap
+EOW_FLAT_WEEKDAY = 4           # 4 = Friday (datetime.weekday(): Mon=0)
+EOW_FLAT_HOUR_UTC = 20
+EOW_FLAT_MINUTE_UTC = 30
+
+# Observed slippage, read from the fills ledger and injected into the kernel's
+# cost gate (risk/kernel.py takes this as a callable — it never queries).
+SLIPPAGE_P75_LOOKBACK = 200    # newest FILLED rows considered
+SLIPPAGE_P75_MIN_ROWS = 20     # below this the fallback constant stands in
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")

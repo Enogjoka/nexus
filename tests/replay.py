@@ -34,6 +34,7 @@ could have run.
 import argparse
 import logging
 import math
+import statistics
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -88,6 +89,48 @@ def load_candles(conn, days: int, symbol: str = SYMBOL, timeframe: str = TIMEFRA
         }
         for row in rows
     ]
+
+
+def _hour_bucket(moment: datetime) -> datetime:
+    return moment.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
+
+def load_basis_by_hour(conn, days: int) -> Dict[datetime, Dict[str, Any]]:
+    """
+    One basis reading per hour bucket, with the band as it stood then.
+
+    The band is recomputed from the readings up to and including each bucket,
+    so a replayed bar sees the history the live pod would have seen — not the
+    band as it looks today, which would be hindsight.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ts, basis FROM basis_readings "
+                "WHERE ts >= %s AND basis IS NOT NULL ORDER BY ts ASC",
+                (since,),
+            )
+            rows = cur.fetchall()
+    except Exception:
+        logger.warning("replay: basis readings unavailable; S3 will stay silent", exc_info=True)
+        return {}
+
+    history: List[float] = []
+    by_hour: Dict[datetime, Dict[str, Any]] = {}
+    for ts, value in rows:
+        history.append(float(value))
+        window = history[-config.S3_BAND_LOOKBACK:]
+        if len(window) < config.S3_MIN_READINGS:
+            continue
+        mean = statistics.fmean(window)
+        by_hour[_hour_bucket(ts)] = {
+            "basis": float(value),
+            "mean": mean,
+            "stdev": statistics.pstdev(window),
+            "n": len(window),
+        }
+    return by_hour
 
 
 def _true_range(bar: Dict, previous_close: Optional[float]) -> float:
@@ -163,6 +206,10 @@ def replay(pod, conn, days: int = 30, bars: Optional[List[Dict]] = None) -> Dict
     if bars is None:
         bars = load_candles(conn, days)
 
+    # S3 reads state["basis"]; every other pod ignores it. Loading it here
+    # rather than per-bar keeps the walk a single pass over the data.
+    basis_by_hour = load_basis_by_hour(conn, days) if conn is not None else {}
+
     vwap_tracker = SessionVWAP()
     atr_tracker = _AtrTracker()
 
@@ -216,6 +263,9 @@ def replay(pod, conn, days: int = 30, bars: Optional[List[Dict]] = None) -> Dict
             "session_label": session_of(bar["ts"]),
             "volume": bar["volume"],
             "prev_volume": previous_volume,
+            # Task 21: S3's evidence, joined by hour bucket. Absent -> the pod
+            # is silent, exactly as it is live when the sensor has no band.
+            "basis": basis_by_hour.get(_hour_bucket(bar["ts"])),
         }
 
         intent = pod.evaluate(tick, state)

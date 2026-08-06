@@ -6,13 +6,17 @@ order it sends has passed kernel.permit() first, without exception and without
 a bypass flag, because INVARIANT 5 is not a policy that can be switched off:
 if permit() denies, the bridge is never touched at all.
 
-IDEMPOTENCY IS A DATABASE CONSTRAINT, NOT A CONVENTION.
-client_order_id is derived deterministically from the signal id (NEXUS-<id>)
-and the fills table holds it UNIQUE. A retried submit, a double-invoked
-scheduler, or a process restart mid-send all collide on that key instead of
-opening a second position. This is what makes the retry below safe: retrying a
-send whose outcome is unknown is only acceptable when a duplicate cannot
-survive.
+RESERVE BEFORE SEND (Task 21 — this closes the Task 16 gap).
+submit() INSERTs a positions row in state RESERVED before it touches the
+bridge. client_order_id is UNIQUE there, so the insert IS the duplicate check:
+two racing submits cannot both succeed, and — the part Task 16 got wrong — a
+fill can no longer land while the ledger write fails, because the row already
+exists by the time the bridge is called. The old flow read the ledger, then
+sent, then wrote; if that last write failed the position was open and
+unrecorded, and a later submit would happily open a second one.
+
+An unusable ledger therefore stops the order dead (LEDGER_UNAVAILABLE) rather
+than proceeding carefully. No ledger, no order.
 
 THE STAGE DOES NOT BRANCH THE CODE PATH.
 MODELED, SHADOW_REAL_BIDASK and LIVE_* all run the same lines. The difference
@@ -20,10 +24,13 @@ between a modelled fill and a real one lives entirely inside the bridge, so
 the path that will one day send real money is the same path exercised by every
 paper trade before it — there is no "live mode" branch that has never run.
 
-NOTHING CALLS submit() YET. The paper engine keeps its own modelled fills; the
-cutover is Task 21's position engine. This is the organ, not the wiring.
+WHO CALLS submit(). As of Task 21, exec_/pod_agent.py does, for pod intents.
+Swing signals still flow through exec_/paper_engine.py's own modelled fills at
+PAPER; the swing cutover happens at SHADOW on the Windows box. Positions opened
+HERE are managed by exec_/position_engine.py and by nothing else.
 """
 import logging
+import math
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -41,6 +48,19 @@ KERNEL_DENIED = "KERNEL_DENIED"
 DUPLICATE = "DUPLICATE"
 BRIDGE_FAILED = "BRIDGE_FAILED"
 INVALID_ORDER = "INVALID_ORDER"
+LEDGER_UNAVAILABLE = "LEDGER_UNAVAILABLE"
+
+# positions.state vocabulary. RESERVED exists for the window between claiming
+# an order id and learning whether it filled — the window the Task 16 flow had
+# no name for, and therefore no row for.
+STATE_RESERVED = "RESERVED"
+STATE_OPEN = "OPEN"
+STATE_PARTIAL = "PARTIAL"
+STATE_BE = "BE"
+STATE_TRAILING = "TRAILING"
+STATE_CLOSED = "CLOSED"
+STATE_FAILED = "FAILED"
+LIVE_STATES = (STATE_OPEN, STATE_PARTIAL, STATE_BE, STATE_TRAILING)
 
 STATUS_FILLED = "FILLED"
 STATUS_REJECTED = "REJECTED"
@@ -51,6 +71,22 @@ _DEFAULT_RETRY_DELAY_SECONDS = 2.0
 
 def client_order_id_for(signal_id: Any) -> str:
     return f"NEXUS-{signal_id}"
+
+
+def _bigint_or_none(value) -> Optional[int]:
+    """
+    fills.signal_id is a BIGINT referring to a row in `signals`. Swing orders
+    have one; POD orders do not — their ids are strings like
+    "S1_FIXFADE-1786015714". Passing that string made the INSERT fail and, since
+    the fills write is best-effort, the audit row vanished silently for every
+    pod trade. NULL is the honest value for an order with no signal behind it.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _num(value) -> Optional[float]:
@@ -85,27 +121,76 @@ class Router:
 
     # -- ledger ------------------------------------------------------------
 
-    def _already_sent(self, client_order_id: str) -> bool:
+    def _reserve(self, order_row: Dict[str, Any]) -> str:
         """
-        True if this order id is already in the ledger.
+        Claim the client_order_id in the positions table BEFORE anything can
+        open a position. Returns "RESERVED", "DUPLICATE" or "UNAVAILABLE".
 
-        Fails CLOSED: if the ledger cannot be read we must assume the order may
-        already exist, because the alternative is opening a second position on
-        a database blip. A missed trade is recoverable; a doubled one is not.
+        This replaces the Task 16 read-then-send check, and the difference is
+        the whole point. A SELECT can only tell you what the ledger knew a
+        moment ago; an INSERT under a UNIQUE constraint is decided by the
+        database at the instant of writing. Two racing submits cannot both
+        succeed, and a fill can no longer land while the ledger write fails —
+        because the row already exists by then.
+
+        Failure to reserve is NOT failure to trade carefully: it is a refusal
+        to trade at all. No ledger, no order.
         """
         try:
-            rows = database.fetch(
-                "SELECT 1 FROM fills WHERE client_order_id = %s LIMIT 1", (client_order_id,)
-            )
-            return bool(rows)
+            with database.get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO positions (client_order_id, source, pod, direction, "
+                        "lots, stop_px, tp1_px, tp2_px, state) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                        "ON CONFLICT (client_order_id) DO NOTHING RETURNING id",
+                        (
+                            order_row["client_order_id"],
+                            order_row["source"],
+                            order_row.get("pod"),
+                            order_row.get("direction"),
+                            order_row.get("lots"),
+                            order_row.get("stop_px"),
+                            order_row.get("tp1_px"),
+                            order_row.get("tp2_px"),
+                            STATE_RESERVED,
+                        ),
+                    )
+                    row = cur.fetchone()
+            return "RESERVED" if row else "DUPLICATE"
         except Exception:
             logger.error(
-                "router: could not check the ledger for %s; assuming it exists "
-                "(refusing to risk a duplicate)",
-                client_order_id,
+                "router: could not reserve %s; refusing to send (no ledger, no order)",
+                order_row["client_order_id"],
                 exc_info=True,
             )
+            return "UNAVAILABLE"
+
+    def _set_position_state(
+        self,
+        client_order_id: str,
+        state: str,
+        entry_px: Optional[float] = None,
+        close_reason: Optional[str] = None,
+        opened: bool = False,
+    ) -> bool:
+        """Advance a reserved row. Best-effort but loudly logged on failure."""
+        try:
+            database.execute(
+                "UPDATE positions SET state = %s, "
+                "entry_px = COALESCE(%s, entry_px), "
+                "close_reason = COALESCE(%s, close_reason), "
+                "opened_at = CASE WHEN %s THEN NOW() ELSE opened_at END, "
+                "closed_at = CASE WHEN %s IN ('CLOSED','FAILED') THEN NOW() ELSE closed_at END "
+                "WHERE client_order_id = %s",
+                (state, entry_px, close_reason, opened, state, client_order_id),
+            )
             return True
+        except Exception:
+            logger.error(
+                "router: could not move %s to %s", client_order_id, state, exc_info=True
+            )
+            return False
 
     def _record(
         self,
@@ -135,7 +220,7 @@ class Router:
                         (
                             ts or datetime.now(timezone.utc),
                             client_order_id,
-                            signal_id,
+                            _bigint_or_none(signal_id),
                             direction,
                             lots,
                             requested_px,
@@ -181,23 +266,19 @@ class Router:
         policy = stage.execution_policy()
         fill_mode = policy.fill_mode
 
-        # 1. Idempotency, before anything else can have a side effect.
-        if self._already_sent(client_order_id):
-            logger.warning("router: %s already in the ledger; not sending again", client_order_id)
-            return {
-                "outcome": DUPLICATE,
-                "client_order_id": client_order_id,
-                "signal_id": signal_id,
-                "reason": "client_order_id already present in fills",
-            }
-
-        # 2. Build the contract. A malformed signal is refused here rather than
-        #    handed to the kernel as a half-formed order.
+        # 1. Build the contract. A malformed signal is refused before it can
+        #    consume a client_order_id — validation has no side effects, so it
+        #    is free to run first.
         prices = (signal or {}).get("prices") or {}
         entry = _num(prices.get("entry"))
         stop = _num(prices.get("stop"))
         lots = _num((signal or {}).get("lots")) or _num(prices.get("lots"))
         direction = str((signal or {}).get("direction") or "").upper()
+        source = str((signal or {}).get("source") or "SWING").upper()
+        pod = (signal or {}).get("pod")
+        expected_edge_usd = _num((signal or {}).get("expected_edge_usd"))
+        tp1 = _num(prices.get("tp1"))
+        tp2 = _num(prices.get("tp2"))
 
         try:
             order = OrderRequest(
@@ -205,8 +286,10 @@ class Router:
                 lots=lots,
                 entry_price=entry,
                 stop_price=stop,
-                source="SWING",
+                source=source,
                 client_order_id=client_order_id,
+                expected_edge_usd=expected_edge_usd,
+                tp_price=tp1,
             )
         except Exception as exc:
             logger.error("router: signal %s is not a valid order (%s)", signal_id, exc)
@@ -230,6 +313,37 @@ class Router:
                 "reason": str(exc),
             }
 
+        # 2. RESERVE. The row exists before the position can. A UNIQUE
+        #    collision here IS the duplicate check, and an unusable ledger
+        #    stops the order dead rather than letting it fill unrecorded.
+        reservation = self._reserve(
+            {
+                "client_order_id": client_order_id,
+                "source": order.source,
+                "pod": pod,
+                "direction": order.direction,
+                "lots": order.lots,
+                "stop_px": order.stop_price,
+                "tp1_px": tp1,
+                "tp2_px": tp2,
+            }
+        )
+        if reservation == "DUPLICATE":
+            logger.warning("router: %s is already reserved; not sending again", client_order_id)
+            return {
+                "outcome": DUPLICATE,
+                "client_order_id": client_order_id,
+                "signal_id": signal_id,
+                "reason": "client_order_id already reserved in positions",
+            }
+        if reservation == "UNAVAILABLE":
+            return {
+                "outcome": LEDGER_UNAVAILABLE,
+                "client_order_id": client_order_id,
+                "signal_id": signal_id,
+                "reason": "could not reserve the order; refusing to send unrecorded",
+            }
+
         # 3. RING 0. There is no path past this that skips it.
         verdict = self._kernel.permit(order)
         if not verdict.allowed:
@@ -248,6 +362,9 @@ class Router:
                 fill_mode=fill_mode,
                 status=STATUS_REJECTED,
                 kernel_reason=f"{verdict.breaker}: {verdict.reason}",
+            )
+            self._set_position_state(
+                client_order_id, STATE_FAILED, close_reason=f"KERNEL_{verdict.breaker}"
             )
             return {
                 "outcome": KERNEL_DENIED,
@@ -285,6 +402,9 @@ class Router:
                 status=STATUS_REJECTED,
                 kernel_reason="bridge returned no fill after one retry",
             )
+            self._set_position_state(
+                client_order_id, STATE_FAILED, close_reason="BRIDGE_FAILED"
+            )
             return {
                 "outcome": BRIDGE_FAILED,
                 "client_order_id": client_order_id,
@@ -307,17 +427,13 @@ class Router:
             status=STATUS_FILLED,
             ts=result.get("ts"),
         )
-        if row_id is None:
-            # The position is OPEN but unrecorded, so the ledger no longer
-            # protects against a duplicate: a later submit would find no row
-            # and send again. Nothing here can undo the fill, so the only
-            # honest response is to make the gap impossible to miss.
-            logger.critical(
-                "router: %s FILLED BUT NOT RECORDED — position is open and the "
-                "ledger does not know; idempotency is not protecting this order. "
-                "Reconcile the book against fills before submitting anything else.",
-                client_order_id,
-            )
+        # The Task 16 "FILLED BUT NOT RECORDED" path is gone: the positions row
+        # was written before the bridge was touched, so a failed fills write
+        # now costs an audit detail, never the system's knowledge that the
+        # position exists.
+        self._set_position_state(
+            client_order_id, STATE_OPEN, entry_px=fill_px, opened=True
+        )
         logger.info(
             "router: SUBMITTED %s %s %.2f lots requested=%.5f fill=%.5f slippage=%.5f mode=%s",
             client_order_id, order.direction, send_lots,
@@ -455,6 +571,38 @@ class Router:
         return {"outcome": STATUS_CLOSED, "success": ok, "closed": len(open_ids)}
 
 
+def observed_slippage_p75() -> Optional[float]:
+    """
+    75th percentile of |slippage| over the newest FILLED rows, or None.
+
+    Homed here rather than in the kernel because Ring 0 must not query
+    anything — the kernel takes this as an injected callable precisely so it
+    stays free of the database. Returns None below config.SLIPPAGE_P75_MIN_ROWS
+    so the kernel falls back to its constant: a percentile over a handful of
+    fills describes this week's luck, not the broker's behaviour.
+
+    Nearest-rank percentile (index = ceil(0.75*n) - 1) rather than an
+    interpolating one, so the answer is always a slippage we actually observed.
+    """
+    try:
+        rows = database.fetch(
+            "SELECT ABS(slippage) FROM fills "
+            "WHERE status = %s AND slippage IS NOT NULL "
+            "ORDER BY id DESC LIMIT %s",
+            (STATUS_FILLED, config.SLIPPAGE_P75_LOOKBACK),
+        )
+    except Exception:
+        logger.warning("router: slippage p75 query failed; kernel will use its fallback",
+                       exc_info=True)
+        return None
+
+    values = sorted(float(row[0]) for row in rows if row[0] is not None)
+    if len(values) < config.SLIPPAGE_P75_MIN_ROWS:
+        return None
+    index = math.ceil(0.75 * len(values)) - 1
+    return values[max(0, index)]
+
+
 def build_kernel(bridge) -> Kernel:
     """
     Wire Ring 0 to the bridge.
@@ -472,4 +620,7 @@ def build_kernel(bridge) -> Kernel:
         get_tick_age_seconds=bridge.get_tick_age_seconds,
         flatten_all=bridge.flatten_all,
         broker_positions=None if is_sim else bridge.positions,
+        # Task 21: the kernel's cost gate now measures real slippage instead of
+        # falling back to a constant, without Ring 0 ever touching the database.
+        get_slippage_p75=observed_slippage_p75,
     )

@@ -37,7 +37,7 @@ def settle(supervisor, timeout=5.0):
 # ---------------------------------------------------------------------------
 
 
-def test_registry_lists_thirteen_agents_in_brief_order():
+def test_registry_lists_sixteen_agents_in_brief_order():
     # Task 16 appended kernel-watchdog and doctrine. They sit last rather than
     # first because the kernel is CONSTRUCTED in main() before any agent thread
     # starts — Ring 0 is live regardless of its watchdog's position here.
@@ -55,6 +55,9 @@ def test_registry_lists_thirteen_agents_in_brief_order():
         "learning",
         "kernel-watchdog",
         "doctrine",
+        "basis",
+        "pod-agent",
+        "position-engine",
     ]
 
 
@@ -71,6 +74,8 @@ def test_registry_kinds_are_valid_and_subscribers_are_the_bus_agents():
         "telegram",
         "state-vector",
         "regime",
+        "pod-agent",
+        "position-engine",
     }
 
 
@@ -82,10 +87,20 @@ def test_every_subscriber_in_the_registry_really_subscribes_and_returns():
     """
     import inspect
 
+    # Task 21 injects the router into two subscribers, so their registry entry
+    # is a thunk rather than the function itself. The property still holds one
+    # level down; this maps each such agent to the implementation that really
+    # subscribes, so the check keeps its teeth instead of being skipped.
+    injected = {
+        "pod-agent": backend.exec_.pod_agent.run_pod_agent,
+        "position-engine": backend.exec_.position_engine.run_position_engine,
+    }
+
     for agent in backend.AGENTS:
         if agent.kind != backend.KIND_SUBSCRIBER:
             continue
-        source = inspect.getsource(agent.target)
+        target = injected.get(agent.name, agent.target)
+        source = inspect.getsource(target)
         assert "BUS.subscribe(" in source, (
             f"{agent.name} is registered as a subscriber but never calls BUS.subscribe"
         )

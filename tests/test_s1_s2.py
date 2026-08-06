@@ -509,7 +509,10 @@ def test_replay_does_not_read_indicator_snapshots():
     assert sql, "expected to find at least one SQL literal"
     for statement in sql:
         assert "indicator_snapshot" not in statement.lower()
-        assert "candles" in statement.lower()
+    # The ATR still comes from bare candles. Task 21 added a second query for
+    # S3's basis readings, so "every query hits candles" is no longer the
+    # property — "the bars are the only indicator source" is.
+    assert any("from candles" in statement.lower() for statement in sql)
 
 
 def test_replay_report_renders_a_traded_window():
