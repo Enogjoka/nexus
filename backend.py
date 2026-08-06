@@ -46,8 +46,11 @@ from core import database
 # failure here is fatal by design — a half-started trading system is worse
 # than one that refuses to boot.
 import ai.analysis
+import ai.doctrine
 import data.gold_agent
+import data.mt5_bridge
 import exec_.paper_engine
+import exec_.router
 import fusion.learning_loop
 import fusion.regime
 import fusion.state_vector
@@ -99,6 +102,13 @@ AGENTS: List[Agent] = [
     # classification. The registry must describe the agent that exists.
     Agent("regime", fusion.regime.run_regime_agent, KIND_SUBSCRIBER),
     Agent("learning", fusion.learning_loop.run_learning_loop, KIND_LOOP),
+    # Appended rather than placed first, even though Ring 0 "boots first":
+    # the kernel is CONSTRUCTED in main() before any agent thread starts, so
+    # it is already live regardless of where its watchdog sits in this list.
+    # Reordering the existing entries would change a start order that has
+    # been verified in a live run, to no benefit.
+    Agent("kernel-watchdog", lambda: get_kernel().run_kernel_watchdog(), KIND_LOOP),
+    Agent("doctrine", ai.doctrine.run_doctrine_agent, KIND_LOOP),
 ]
 
 _RESTART_WINDOW_SECONDS = 3600.0
@@ -107,6 +117,46 @@ _RESTART_WINDOW_SECONDS = 3600.0
 def configure_logging() -> None:
     """INFO to stderr, with the thread name — the only way to read this log."""
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+
+
+# --------------------------------------------------------------------------
+# Execution stack. Built ONCE at boot, before any agent thread exists, so that
+# Ring 0 is live before anything can ask it for permission. The accessors are
+# read-only views; there is no setter and nothing rebuilds these at runtime.
+# --------------------------------------------------------------------------
+
+_BRIDGE = None
+_KERNEL = None
+_ROUTER = None
+
+
+def build_execution_stack():
+    """Construct bridge -> kernel -> router, in that order of dependency."""
+    global _BRIDGE, _KERNEL, _ROUTER
+    _BRIDGE = data.mt5_bridge.make_bridge()
+    _KERNEL = exec_.router.build_kernel(_BRIDGE)
+    _ROUTER = exec_.router.Router(_BRIDGE, _KERNEL)
+    logger.info(
+        "execution stack ready: bridge=%s kernel=%s router=%s",
+        type(_BRIDGE).__name__, type(_KERNEL).__name__, type(_ROUTER).__name__,
+    )
+    return _ROUTER
+
+
+def get_bridge():
+    return _BRIDGE
+
+
+def get_kernel():
+    """The process's single Kernel. None until build_execution_stack() runs."""
+    if _KERNEL is None:
+        raise RuntimeError("execution stack not built; call build_execution_stack() first")
+    return _KERNEL
+
+
+def get_router():
+    """Accessor for Task 21's position engine. Nothing calls submit() yet."""
+    return _ROUTER
 
 
 def boot_database() -> List[str]:
@@ -354,6 +404,8 @@ def main() -> int:
     logger.info("NEXUS starting - stage=%s", get_stage().value)
 
     boot_database()
+    # Ring 0 exists before any agent does.
+    build_execution_stack()
 
     supervisor = Supervisor()
     signal.signal(signal.SIGINT, supervisor.request_stop)

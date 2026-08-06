@@ -325,6 +325,17 @@ DOCTRINE_CADENCE_QUIET_MIN = 60    # ASIA / OFF
 TRIAGE_THRESHOLD = 0.5
 TRIAGE_MAX_TOKENS = 200
 
+# BRIDGE (data/mt5_bridge.py) — the broker seam.
+# MetaTrader5's Python package is Windows-only, so the broker sits behind a
+# protocol with two implementations: SimBridge runs everywhere, RealMT5Bridge
+# activates only where the package imports. Nothing above the seam knows which
+# one it is talking to.
+SIM_SPREAD_USD = 0.35     # inside the 0.45 kernel ceiling, so SIM can trade
+SIM_SLIPPAGE_USD = 0.05   # modeled adverse slippage per side; never favourable
+# Read at boot and never mutated at runtime, the same discipline as STAGE.
+# There is no setter and no code path that writes this back.
+BRIDGE_KIND = "SIM"       # "SIM" | "MT5"
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")

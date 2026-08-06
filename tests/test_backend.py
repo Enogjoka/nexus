@@ -37,7 +37,10 @@ def settle(supervisor, timeout=5.0):
 # ---------------------------------------------------------------------------
 
 
-def test_registry_lists_eleven_agents_in_brief_order():
+def test_registry_lists_thirteen_agents_in_brief_order():
+    # Task 16 appended kernel-watchdog and doctrine. They sit last rather than
+    # first because the kernel is CONSTRUCTED in main() before any agent thread
+    # starts — Ring 0 is live regardless of its watchdog's position here.
     assert [a.name for a in backend.AGENTS] == [
         "data",
         "analysis-scheduler",
@@ -50,6 +53,8 @@ def test_registry_lists_eleven_agents_in_brief_order():
         "state-vector",
         "regime",
         "learning",
+        "kernel-watchdog",
+        "doctrine",
     ]
 
 
