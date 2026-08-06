@@ -366,6 +366,28 @@ POD_MAX_CONSECUTIVE_LOSSES = 3    # then disabled until the next doctrine re-ena
 POD_DAILY_LOSS_CAP_USD = 50.0     # then disabled until UTC midnight
 POD_MAX_TRADES_PER_DAY = 10       # then disabled until UTC midnight
 
+# PODS.S1 — FIX-FADE. The 15:00 UTC PM gold fix drags price away from the
+# session mean; the pod fades the stretch back toward VWAP. Armed only around
+# the fix, because outside that window the same stretch means something else.
+S1_STRETCH_ATR_MULT = 1.2   # stretch vs session VWAP, measured in ATR(h1)
+S1_WINDOW_BEFORE_MIN = 45   # arm window before 15:00 UTC
+S1_WINDOW_AFTER_MIN = 30    # and after
+S1_STOP_ATR_MULT = 0.8
+S1_TP_ATR_MULT = 1.0
+S1_LOTS = 0.01
+
+# PODS.S2 — VWAP-SNAP. A range-bound session that displaces far from VWAP on
+# FALLING volume is a move without participation; the pod trades the snap back.
+S2_SIGMA_MULT = 2.0          # displacement vs session VWAP, in session stdev
+S2_STOP_ATR_MULT = 0.7
+S2_TP_VWAP_FRACTION = 0.8    # target 80% of the way back to VWAP, never past it
+S2_LOTS = 0.01
+
+# A pod's stated edge is a FORECAST and the cost gate treats it as a claim, so
+# it is discounted before being claimed. Half is deliberately blunt: the point
+# is that no pod may present its best case as its expected case.
+EDGE_HAIRCUT = 0.5           # expected_edge = |tp-entry| * oz * lots * HAIRCUT
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
