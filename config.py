@@ -347,6 +347,25 @@ LINK_HEARTBEAT_SECONDS = 10
 LINK_STALE_SECONDS = 35              # 3 missed heartbeats + slack
 LINK_MAX_CLOCK_SKEW_SECONDS = 30
 
+# PODS (pods/base.py) — the scalp-pod framework and the cost gate.
+#
+# COST_MULT is the single number separating micro-scalping from donating the
+# account to the broker in 30-cent increments. A scalp must expect to earn a
+# MULTIPLE of what it costs to put on, not merely to beat it: at 1.0x a
+# strategy that is right slightly more often than not still bleeds, because the
+# cost is certain and the edge is a forecast. The floor of 2.0 is enforced in
+# code (see pods/base.py) and is not a preference — lowering it is how a
+# profitable-looking scalper turns into a fee pump.
+COST_MULT = 2.0
+COMMISSION_USD_PER_LOT = 7.0      # EBC round-turn per 1.0 lot; scaled by lots
+SLIPPAGE_P75_FALLBACK_USD = 0.10  # used until the fills table has >= 20 rows
+
+# Per-pod circuit breakers. These bound how much one misbehaving strategy can
+# cost before a human looks at it.
+POD_MAX_CONSECUTIVE_LOSSES = 3    # then disabled until the next doctrine re-enables it
+POD_DAILY_LOSS_CAP_USD = 50.0     # then disabled until UTC midnight
+POD_MAX_TRADES_PER_DAY = 10       # then disabled until UTC midnight
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")

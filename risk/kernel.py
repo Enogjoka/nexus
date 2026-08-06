@@ -47,6 +47,14 @@ from risk import stage
 
 logger = logging.getLogger(__name__)
 
+# The cost gate's multiplier is doctrine, not a knob. Checked at IMPORT so a
+# lowered value can never reach a live order path — by the time an order is
+# being judged it is far too late to discover the yardstick was shortened.
+if config.COST_MULT < 2.0:
+    raise RuntimeError(
+        "COST_MULT floor is 2.0 — the cost gate's multiplier is doctrine, not a knob"
+    )
+
 # Breaker names. These are the vocabulary of the kernel_events audit table and
 # of every denial reason a human will ever read; they are stable identifiers,
 # not display strings.
@@ -63,6 +71,7 @@ SPREAD_UNKNOWN = "SPREAD_UNKNOWN"
 SPREAD_CEILING = "SPREAD_CEILING"
 STALE_DATA = "STALE_DATA"
 STOP_GEOMETRY = "STOP_GEOMETRY"
+COST_GATE = "COST_GATE"
 RECONCILIATION = "RECONCILIATION"
 NONE = "NONE"  # kernel_events.breaker is NOT NULL; an allow still needs a value
 
@@ -97,6 +106,11 @@ class OrderRequest(BaseModel):
     stop_price: float = Field(gt=0)
     source: Literal["SWING", "POD"]  # pods arrive in Task 18
     client_order_id: str
+    # Task 18 additions. Optional so every existing caller stays valid: a swing
+    # order has no stated edge and is exempt from the cost gate, while a POD
+    # order without one is denied rather than guessed at.
+    expected_edge_usd: Optional[float] = Field(default=None, gt=0)
+    tp_price: Optional[float] = Field(default=None, gt=0)
 
 
 def _utc_midnight_after(moment: datetime) -> datetime:
@@ -143,6 +157,9 @@ class Kernel:
         flatten_all: Callable[[str], bool],
         broker_positions: Optional[Callable[[], List[Dict[str, Any]]]] = None,
         now_utc: Optional[Callable[[], datetime]] = None,
+        # Task 18: observed 75th-percentile slippage. Task 21 wires the
+        # fills-table read; None means the fallback constant stands in.
+        get_slippage_p75: Optional[Callable[[], Optional[float]]] = None,
     ) -> None:
         self._get_equity = get_equity
         self._get_open_positions = get_open_positions
@@ -151,6 +168,7 @@ class Kernel:
         self._flatten_all = flatten_all
         self._broker_positions = broker_positions
         self._now_utc = now_utc or (lambda: datetime.now(timezone.utc))
+        self._get_slippage_p75 = get_slippage_p75
 
         # Read ONCE, at construction. The policy cannot change under a running
         # kernel any more than the stage can (INVARIANT 1).
@@ -539,12 +557,128 @@ class Kernel:
                 ctx,
             )
 
+        # 11. COST GATE — the rule that separates scalping from donating the
+        #     account to the broker in 30-cent increments.
+        cost_verdict = self._cost_gate(order, effective_lots, ctx)
+        if cost_verdict is not None:
+            return cost_verdict
+
         return self._allow(
             f"{order.direction} {effective_lots} lots permitted at "
             f"{self._policy.stage.value}",
             clamped_lots,
             {**ctx, "effective_lots": effective_lots},
         )
+
+    # -- the cost gate -----------------------------------------------------
+
+    def _slippage_p75(self) -> float:
+        """
+        The 75th-percentile slippage to budget for, in dollars per ounce.
+
+        Task 21 wires the fills-table read. Until then — and whenever the
+        callable is absent, raises, or hands back something that is not a real
+        positive number — the fallback constant stands in. An unusable reading
+        is NEVER read as "no slippage": that would make the gate cheapest
+        exactly when our own measurements are broken.
+        """
+        fallback = float(config.SLIPPAGE_P75_FALLBACK_USD)
+        if self._get_slippage_p75 is None:
+            return fallback
+
+        try:
+            observed = self._get_slippage_p75()
+        except Exception:
+            logger.warning(
+                "kernel: get_slippage_p75 raised; falling back to %.4f", fallback, exc_info=True
+            )
+            return fallback
+
+        try:
+            value = float(observed)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kernel: get_slippage_p75 returned %r; falling back to %.4f", observed, fallback
+            )
+            return fallback
+
+        # NaN fails every comparison including this one, which is the point.
+        if value != value or value in (float("inf"), float("-inf")) or value <= 0:
+            logger.warning(
+                "kernel: get_slippage_p75 returned %r; falling back to %.4f", value, fallback
+            )
+            return fallback
+        return value
+
+    def _cost_gate(
+        self, order: "OrderRequest", effective_lots: float, ctx: Dict[str, Any]
+    ) -> Optional["Verdict"]:
+        """
+        Refuse a scalp that does not expect to earn a MULTIPLE of what it costs.
+
+        Returns a denial Verdict, or None to continue to _allow.
+
+        A scalp's cost is certain and its edge is a forecast. At 1x a strategy
+        that is right slightly more often than not still bleeds, because it pays
+        the spread, the slippage and the commission on every single attempt
+        while collecting the edge only on the winners. config.COST_MULT is the
+        margin demanded for that asymmetry, and its floor is enforced at import.
+
+        Swings are exempt by design, not by oversight: a swing's edge is
+        measured in dollars per hundreds of pips, against the same fixed cost a
+        scalp pays over a handful. The gate exists for trades whose cost is a
+        material fraction of the move, and applying it to swings would deny on
+        an arithmetic that was never about them.
+
+        Spread is taken from ctx — the value already read at check 8. Re-reading
+        the bridge here could judge the order against a different market than
+        the one the spread breaker just approved.
+        """
+        if order.source == "SWING":
+            self._record(COST_GATE, "PASS", "swing exempt", ctx)
+            return None
+
+        if order.expected_edge_usd is None:
+            # Fail closed: a pod that will not state its edge cannot be judged,
+            # and an unjudged scalp is exactly what this gate exists to stop.
+            return self._deny(COST_GATE, "pod order without stated edge", ctx)
+
+        spread = float(ctx.get("spread") or 0.0)
+        slippage_p75 = self._slippage_p75()
+
+        # Slippage is paid on both sides; the spread is already a round-turn
+        # cost in a bid/ask quote. Both are per-ounce, so they scale by
+        # contract size; commission is quoted per lot and does not.
+        commission_usd = config.COMMISSION_USD_PER_LOT * effective_lots
+        market_cost_usd = (
+            (spread + 2.0 * slippage_p75) * config.CONTRACT_SIZE_OZ * effective_lots
+        )
+        total_cost_usd = market_cost_usd + commission_usd
+        threshold_usd = config.COST_MULT * total_cost_usd
+
+        numbers = {
+            **ctx,
+            "expected_edge_usd": order.expected_edge_usd,
+            "spread": spread,
+            "slippage_p75": slippage_p75,
+            "commission_usd": commission_usd,
+            "effective_lots": effective_lots,
+            "total_cost_usd": total_cost_usd,
+            "cost_mult": config.COST_MULT,
+            "threshold_usd": threshold_usd,
+        }
+        arithmetic = (
+            f"edge ${order.expected_edge_usd:.4f} vs threshold ${threshold_usd:.4f} "
+            f"({config.COST_MULT}x cost ${total_cost_usd:.4f} = spread {spread:.4f} "
+            f"+ 2x slippage {slippage_p75:.4f} over {config.CONTRACT_SIZE_OZ}oz "
+            f"x {effective_lots} lots + commission ${commission_usd:.4f})"
+        )
+
+        if order.expected_edge_usd < threshold_usd:
+            return self._deny(COST_GATE, f"edge does not clear the cost gate: {arithmetic}", numbers)
+
+        self._record(COST_GATE, "PASS", f"edge clears the cost gate: {arithmetic}", numbers)
+        return None
 
     # -- reconciliation ----------------------------------------------------
 

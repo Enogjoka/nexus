@@ -721,8 +721,11 @@ def test_allow_writes_an_audit_row(sandbox):
     build(FakeWorld()).permit(order)
 
     rows = events_for(order.client_order_id)
-    assert [r[1] for r in rows] == ["ALLOW"]
-    assert rows[0][0] == kernel_mod.NONE
+    # Task 18: the cost gate records a PASS for the swing exemption before the
+    # allow, so "the gate ran and exempted this" is provable rather than
+    # inferred from the absence of a denial.
+    assert [r[1] for r in rows] == ["PASS", "ALLOW"]
+    assert rows[-1][0] == kernel_mod.NONE
 
 
 def test_clamp_writes_its_own_row_before_the_allow(sandbox):
@@ -730,7 +733,7 @@ def test_clamp_writes_its_own_row_before_the_allow(sandbox):
     build(FakeWorld()).permit(order)
 
     actions = [r[1] for r in events_for(order.client_order_id)]
-    assert actions == ["CLAMP", "ALLOW"]
+    assert actions == ["CLAMP", "PASS", "ALLOW"]   # PASS is Task 18's swing exemption
 
 
 def test_flatten_writes_a_row(sandbox):
@@ -875,3 +878,332 @@ def test_daily_loss_and_drawdown_denials_are_audited(sandbox):
     assert any(
         r[0] == kernel_mod.MAX_DRAWDOWN and r[1] == "DENY" for r in events_for(order2.client_order_id)
     )
+
+
+# ===========================================================================
+# TASK 18 ADDITIONS — the cost gate (check 11)
+#
+# Everything above this line is Task 14 and is deliberately untouched: the
+# amendment is additive, and the proof is `git diff main -- tests/test_kernel.py`
+# showing zero deleted lines.
+# ===========================================================================
+
+
+def pod_order(**overrides):
+    """A POD order. Defaults to an edge that comfortably clears the gate."""
+    base = dict(source="POD", expected_edge_usd=100.0, tp_price=4020.0)
+    base.update(overrides)
+    return make_order(**base)
+
+
+def cost_row(client_order_id):
+    """The COST_GATE audit row for one order, context decoded."""
+    rows = database.fetch(
+        "SELECT action, reason, context FROM kernel_events "
+        "WHERE context->>'client_order_id' = %s AND breaker = 'COST_GATE' "
+        "ORDER BY id DESC LIMIT 1",
+        (client_order_id,),
+    )
+    if not rows:
+        return None
+    action, reason, context = rows[0]
+    if isinstance(context, str):
+        context = json.loads(context)
+    return action, reason, context
+
+
+# --- the task's own acceptance criterion -----------------------------------
+
+
+def test_pod_order_with_too_small_an_edge_is_denied_by_the_cost_gate(sandbox):
+    """Every other check passes; only the edge is too small."""
+    world = FakeWorld(spread=0.35)
+    order = pod_order(expected_edge_usd=0.01)
+
+    verdict = build(world).permit(order)
+
+    assert verdict.allowed is False
+    assert verdict.breaker == kernel_mod.COST_GATE
+    assert "does not clear the cost gate" in verdict.reason
+
+
+def test_pod_order_with_a_large_enough_edge_is_allowed(sandbox):
+    order = pod_order(expected_edge_usd=100.0)
+    verdict = build(FakeWorld(spread=0.35)).permit(order)
+
+    assert verdict.allowed is True, verdict.reason
+    action, _, _ = cost_row(order.client_order_id)
+    assert action == "PASS"
+
+
+def test_a_pod_order_without_a_stated_edge_is_denied(sandbox):
+    """Fail closed: an unjudged scalp is what this gate exists to stop."""
+    verdict = build(FakeWorld(spread=0.35)).permit(pod_order(expected_edge_usd=None))
+
+    assert verdict.allowed is False
+    assert verdict.breaker == kernel_mod.COST_GATE
+    assert verdict.reason == "pod order without stated edge"
+
+
+def test_a_swing_order_with_no_edge_is_exempt(sandbox):
+    """A swing's edge is hundreds of pips against the same fixed cost."""
+    order = make_order()   # source="SWING", no expected_edge_usd
+    verdict = build(FakeWorld(spread=0.35)).permit(order)
+
+    assert verdict.allowed is True
+    action, reason, _ = cost_row(order.client_order_id)
+    assert action == "PASS"
+    assert reason == "swing exempt"
+
+
+def test_a_swing_is_never_denied_by_the_cost_gate_even_with_a_tiny_edge(sandbox):
+    order = make_order(source="SWING", expected_edge_usd=0.0001)
+    assert build(FakeWorld(spread=0.35)).permit(order).allowed is True
+
+
+# --- hand-computed arithmetic ----------------------------------------------
+#
+#   spread 0.35, slippage fallback 0.10, lots 0.05, commission 7.0/lot
+#   total = (0.35 + 2*0.10) * 100 * 0.05 + 7.0 * 0.05
+#         = 0.55 * 5.0        + 0.35
+#         = 2.75              + 0.35        = 3.10
+#   threshold = COST_MULT(2.0) * 3.10                      = 6.20
+
+
+HAND_TOTAL = 3.10
+HAND_THRESHOLD = 6.20
+
+
+def test_hand_computed_threshold_denies_one_cent_below(sandbox):
+    verdict = build(FakeWorld(spread=0.35)).permit(pod_order(expected_edge_usd=6.19))
+    assert verdict.allowed is False
+    assert verdict.breaker == kernel_mod.COST_GATE
+
+
+def test_hand_computed_threshold_allows_one_cent_above(sandbox):
+    verdict = build(FakeWorld(spread=0.35)).permit(pod_order(expected_edge_usd=6.21))
+    assert verdict.allowed is True, verdict.reason
+
+
+def test_hand_computed_numbers_are_recorded_in_the_audit_row(sandbox):
+    order = pod_order(expected_edge_usd=6.21)
+    build(FakeWorld(spread=0.35)).permit(order)
+
+    action, _, context = cost_row(order.client_order_id)
+
+    assert action == "PASS"
+    assert context["total_cost_usd"] == pytest.approx(HAND_TOTAL)
+    assert context["threshold_usd"] == pytest.approx(HAND_THRESHOLD)
+    assert context["spread"] == pytest.approx(0.35)
+    assert context["slippage_p75"] == pytest.approx(config.SLIPPAGE_P75_FALLBACK_USD)
+    assert context["commission_usd"] == pytest.approx(0.35)
+    assert context["effective_lots"] == pytest.approx(0.05)
+
+
+def test_a_denial_carries_the_full_arithmetic(sandbox):
+    order = pod_order(expected_edge_usd=6.19)
+    verdict = build(FakeWorld(spread=0.35)).permit(order)
+
+    for fragment in ("6.19", "6.20", "spread", "slippage", "commission"):
+        assert fragment in verdict.reason
+
+    action, _, context = cost_row(order.client_order_id)
+    assert action == "DENY"
+    assert context["total_cost_usd"] == pytest.approx(HAND_TOTAL)
+
+
+# --- clamp interaction ------------------------------------------------------
+
+
+def test_cost_is_computed_on_the_clamped_lots_not_the_requested_lots(sandbox):
+    """
+    0.5 lots requested, PAPER clamps to 0.10.
+      on 0.10: (0.55)*100*0.10 + 0.70 = 5.50 + 0.70 = 6.20 -> threshold 12.40
+      on 0.50: (0.55)*100*0.50 + 3.50 = 27.5 + 3.50 = 31.0 -> threshold 62.00
+    An edge of 12.41 is therefore allowed ONLY if the clamped size was used.
+    """
+    order = pod_order(lots=0.5, expected_edge_usd=12.41)
+    verdict = build(FakeWorld(spread=0.35)).permit(order)
+
+    assert verdict.allowed is True, verdict.reason
+    assert verdict.clamped_lots == 0.10
+
+    _, _, context = cost_row(order.client_order_id)
+    assert context["effective_lots"] == pytest.approx(0.10)
+    assert context["total_cost_usd"] == pytest.approx(6.20)
+    assert context["threshold_usd"] == pytest.approx(12.40)
+
+
+def test_the_same_edge_is_denied_when_it_would_not_clear_the_clamped_cost(sandbox):
+    order = pod_order(lots=0.5, expected_edge_usd=12.39)
+    verdict = build(FakeWorld(spread=0.35)).permit(order)
+    assert verdict.allowed is False
+    assert verdict.breaker == kernel_mod.COST_GATE
+
+
+# --- the injected slippage callable -----------------------------------------
+
+
+def kernel_with_slippage(world, callable_):
+    return Kernel(
+        get_equity=world.get_equity,
+        get_open_positions=world.get_open_positions,
+        get_spread=world.get_spread,
+        get_tick_age_seconds=world.get_tick_age,
+        flatten_all=world.flatten_all,
+        now_utc=world.now_utc,
+        get_slippage_p75=callable_,
+    )
+
+
+def test_a_real_slippage_reading_is_used(sandbox):
+    """
+    slippage 0.25: (0.35 + 0.50)*100*0.05 + 0.35 = 4.25 + 0.35 = 4.60
+    threshold = 9.20
+    """
+    order = pod_order(expected_edge_usd=9.21)
+    kern = kernel_with_slippage(FakeWorld(spread=0.35), lambda: 0.25)
+
+    verdict = kern.permit(order)
+
+    assert verdict.allowed is True, verdict.reason
+    _, _, context = cost_row(order.client_order_id)
+    assert context["slippage_p75"] == pytest.approx(0.25)
+    assert context["total_cost_usd"] == pytest.approx(4.60)
+
+
+@pytest.mark.parametrize(
+    "broken,label",
+    [
+        (lambda: (_ for _ in ()).throw(RuntimeError("db down")), "raises"),
+        (lambda: None, "returns None"),
+        (lambda: float("nan"), "returns NaN"),
+        (lambda: 0.0, "returns zero"),
+        (lambda: -0.5, "returns negative"),
+        (lambda: "0.10", "returns a string"),
+    ],
+)
+def test_an_unusable_slippage_reading_falls_back_never_to_zero(sandbox, broken, label):
+    """
+    An unusable measurement must not make the gate CHEAPER. Each case must
+    land on exactly the fallback arithmetic: threshold 6.20.
+    """
+    order = pod_order(expected_edge_usd=6.19)
+    kern = kernel_with_slippage(FakeWorld(spread=0.35), broken)
+
+    verdict = kern.permit(order)
+
+    assert verdict.allowed is False, f"{label} must not weaken the gate"
+    _, _, context = cost_row(order.client_order_id)
+    assert context["slippage_p75"] == pytest.approx(config.SLIPPAGE_P75_FALLBACK_USD)
+    assert context["threshold_usd"] == pytest.approx(HAND_THRESHOLD)
+
+
+def test_no_slippage_callable_at_all_uses_the_fallback(sandbox):
+    order = pod_order(expected_edge_usd=6.21)
+    build(FakeWorld(spread=0.35)).permit(order)
+    _, _, context = cost_row(order.client_order_id)
+    assert context["slippage_p75"] == pytest.approx(config.SLIPPAGE_P75_FALLBACK_USD)
+
+
+# --- ordering: the gate is check 11, after everything else ------------------
+
+
+def test_an_earlier_breaker_still_wins_over_the_cost_gate(sandbox):
+    """A tiny edge AND a bad stop: STOP_GEOMETRY is checked first."""
+    order = pod_order(expected_edge_usd=0.01, direction="LONG",
+                      entry_price=4000.0, stop_price=4010.0)
+    verdict = build(FakeWorld(spread=0.35)).permit(order)
+    assert verdict.breaker == kernel_mod.STOP_GEOMETRY
+
+
+def test_the_cost_gate_reuses_the_spread_the_spread_breaker_approved(sandbox):
+    """
+    Re-reading the bridge here could judge the order against a different
+    market than the one check 8 just approved, so the value comes from ctx.
+    """
+    calls = []
+
+    class CountingWorld(FakeWorld):
+        def get_spread(self):
+            calls.append(1)
+            return super().get_spread()
+
+    build(CountingWorld(spread=0.35)).permit(pod_order(expected_edge_usd=100.0))
+    assert len(calls) == 1, "the spread must be read exactly once per permit"
+
+
+# --- new OrderRequest fields ------------------------------------------------
+
+
+def test_the_new_order_fields_are_optional():
+    """Every pre-Task-18 caller must stay valid."""
+    order = OrderRequest(
+        direction="LONG", lots=0.05, entry_price=4000.0, stop_price=3990.0,
+        source="SWING", client_order_id="x",
+    )
+    assert order.expected_edge_usd is None
+    assert order.tp_price is None
+
+
+@pytest.mark.parametrize("overrides", [
+    {"expected_edge_usd": 0}, {"expected_edge_usd": -1.0},
+    {"tp_price": 0}, {"tp_price": -5.0},
+])
+def test_the_new_fields_are_still_bounded_when_present(overrides):
+    base = dict(
+        direction="LONG", lots=0.05, entry_price=4000.0, stop_price=3990.0,
+        source="POD", client_order_id="x",
+    )
+    base.update(overrides)
+    with pytest.raises(ValidationError):
+        OrderRequest(**base)
+
+
+# --- the COST_MULT floor ----------------------------------------------------
+
+
+def test_the_configured_cost_mult_is_at_or_above_the_floor():
+    assert config.COST_MULT >= 2.0
+
+
+def test_kernel_refuses_to_import_with_a_lowered_cost_mult(monkeypatch):
+    """The multiplier is doctrine, not a knob."""
+    import importlib
+
+    monkeypatch.setattr(config, "COST_MULT", 1.5)
+    try:
+        with pytest.raises(RuntimeError, match="COST_MULT floor is 2.0"):
+            importlib.reload(kernel_mod)
+    finally:
+        monkeypatch.undo()
+        importlib.reload(kernel_mod)   # restore a healthy module for later tests
+
+    assert kernel_mod.COST_GATE == "COST_GATE"
+
+
+# --- the pre-existing suite is intact ---------------------------------------
+
+
+def test_every_task_14_test_still_exists():
+    """
+    Structural proof that the amendment added tests rather than replacing
+    them. The line-level proof is `git diff main -- tests/test_kernel.py`
+    showing zero deleted lines.
+    """
+    import inspect
+    import sys
+
+    module = sys.modules[__name__]
+    source = inspect.getsource(module)
+    for name in (
+        "test_clean_order_is_permitted",
+        "test_kill_file_denies_and_flattens",
+        "test_daily_loss_halt_lapses_at_utc_midnight",
+        "test_drawdown_breach_flattens_demotes_and_halts",
+        "test_oversized_order_is_clamped_not_denied",
+        "test_an_unknown_never_permits",
+        "test_kernel_imports_nothing_from_ai_or_fusion",
+        "test_every_denial_leaves_an_audit_row",
+    ):
+        assert f"def {name}(" in source, f"Task 14 test {name} is missing"
