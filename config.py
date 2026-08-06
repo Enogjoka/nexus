@@ -336,6 +336,17 @@ SIM_SLIPPAGE_USD = 0.05   # modeled adverse slippage per side; never favourable
 # There is no setter and no code path that writes this back.
 BRIDGE_KIND = "SIM"       # "SIM" | "MT5"
 
+# LINK (link/channel.py, link/messages.py) — the nervous system between the
+# brain box and the exec box. Today both ends loopback on one machine; later
+# the brain is an Ubuntu VPS and exec is a Windows box beside the broker.
+# HMAC_SECRET (below, from the environment) signs every frame; without it the
+# link refuses to start.
+LINK_HOST = "127.0.0.1"
+LINK_PORT = 8765
+LINK_HEARTBEAT_SECONDS = 10
+LINK_STALE_SECONDS = 35              # 3 missed heartbeats + slack
+LINK_MAX_CLOCK_SKEW_SECONDS = 30
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
