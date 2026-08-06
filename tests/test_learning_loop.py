@@ -5,12 +5,28 @@ the two deferred wirings it closes in ai/analysis.py.
 NO network. Reports are written to a tmp_path, never the repo's reports/.
 DB-backed tests use FAR-FUTURE (year 2099) timestamps so they sort ahead of
 and never collide with real rows; the autouse fixture purges them.
+
+ISOLATION (task 16.1). A future timestamp separates our rows from real ones,
+but it does not separate our POPULATION from theirs: _step_rank_dims and
+_load_outcome_pairs aggregate over the whole signals x state_vectors join with
+no time filter, which is correct production behaviour and is not changing.
+Once nexus_dev accumulated real rows from the Task 10-16 acceptance runs, the
+seeded arithmetic stopped being the only arithmetic — 21 ambient signals
+qualified, past LEARN_MIN_SAMPLES, so a "constant" dim was no longer constant
+and a deliberately-too-small sample was no longer too small.
+
+Tests that pin the loop's maths therefore run inside scoped_conn(), which owns
+the whole table for the duration of one test by deleting the ambient rows in a
+transaction that is never committed. The seeded values and every expected
+number below are unchanged; only the population they are computed over is.
 """
 import json
 import logging
 import os
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
+import psycopg2
 import pytest
 
 import config
@@ -25,6 +41,42 @@ requires_db = pytest.mark.skipif(not config.DATABASE_URL, reason="DATABASE_URL n
 
 _FUTURE = datetime(2099, 6, 1, 2, 0, tzinfo=timezone.utc)
 _CUTOFF = datetime(2099, 1, 1, tzinfo=timezone.utc)
+
+# Every row this file seeds carries this symbol prefix; everything else in the
+# database is ambient and must be invisible to a population-sensitive test.
+_MARKER = "TST_LL"
+
+
+@contextmanager
+def scoped_conn():
+    """
+    A connection on which the learning loop sees ONLY this test's seeded rows,
+    and whose work is ALWAYS rolled back.
+
+    Ambient signals are deleted rather than merely unlinked: _step_link
+    back-links every signal whose state_vector_id IS NULL, so detaching them
+    would simply re-attach them one step later. Nothing is committed, so the
+    real rows are untouched the moment the block exits — including on failure.
+
+    Reads that need to see the loop's writes (dim_rankings) must go through
+    fetch_on() on this same connection; a second connection would sit outside
+    the transaction and see nothing.
+    """
+    conn = psycopg2.connect(config.DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM signals WHERE symbol IS NULL OR symbol NOT LIKE %s", (f"{_MARKER}%",))
+        yield conn
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+def fetch_on(conn, sql, params=None):
+    """Read inside scoped_conn's uncommitted transaction."""
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
 
 
 @pytest.fixture(autouse=True)
@@ -89,18 +141,20 @@ def seed_correlated(conn, n=12):
 
 @requires_db
 def test_nightly_ranks_engineered_dim_at_plus_one():
-    with database.get_conn() as conn:
+    with scoped_conn() as conn:
         seed_correlated(conn, n=12)
         summary = loop.nightly_job(conn, _FUTURE)
+        rows = fetch_on(
+            conn,
+            "SELECT dim, spearman, n_samples FROM dim_rankings "
+            "WHERE computed_at = %s AND dim = 'rsi_h1'",
+            (_FUTURE,),
+        )
 
     assert summary["steps"]["embed"]["embedded"] >= 12   # embed step did real work
     assert summary["steps"]["rank_dims"]["status"] == "ok"
     assert summary["steps"]["rank_dims"]["samples"] >= 12
 
-    rows = database.fetch(
-        "SELECT dim, spearman, n_samples FROM dim_rankings WHERE computed_at = %s AND dim = 'rsi_h1'",
-        (_FUTURE,),
-    )
     assert len(rows) == 1
     dim, spearman, n_samples = rows[0]
     assert float(spearman) == pytest.approx(1.0, abs=1e-4)  # perfect monotonic relationship
@@ -109,29 +163,37 @@ def test_nightly_ranks_engineered_dim_at_plus_one():
 
 @requires_db
 def test_nightly_skips_ranking_below_min_samples(caplog):
-    with database.get_conn() as conn:
+    with scoped_conn() as conn:
         seed_correlated(conn, n=3)  # below LEARN_MIN_SAMPLES (10)
         with caplog.at_level(logging.INFO):
             summary = loop.nightly_job(conn, _FUTURE)
+        persisted = fetch_on(
+            conn, "SELECT count(*) FROM dim_rankings WHERE computed_at = %s", (_FUTURE,)
+        )[0][0]
 
     assert summary["steps"]["rank_dims"]["status"] == "skipped_min_samples"
     assert summary["steps"]["rank_dims"]["ranked"] == 0
     assert "skipping" in caplog.text
-    assert database.fetch("SELECT count(*) FROM dim_rankings WHERE computed_at = %s", (_FUTURE,))[0][0] == 0
+    assert persisted == 0
 
 
 @requires_db
 def test_nightly_does_not_persist_constant_dims():
     # rsi_h4 is seeded at a constant 50 for every row: no rank order exists, so
-    # scipy would return NaN. It must be skipped, never persisted.
-    with database.get_conn() as conn:
+    # scipy would return NaN. It must be skipped, never persisted. This only
+    # holds if the seeded rows ARE the population — an ambient row with a
+    # different rsi_h4 makes the dim vary and the test meaningless.
+    with scoped_conn() as conn:
         seed_correlated(conn, n=12)
         summary = loop.nightly_job(conn, _FUTURE)
+        persisted = fetch_on(
+            conn,
+            "SELECT count(*) FROM dim_rankings WHERE computed_at = %s AND dim = 'rsi_h4'",
+            (_FUTURE,),
+        )[0][0]
 
     assert "rsi_h4" in summary["steps"]["rank_dims"]["skipped_dims"]
-    assert database.fetch(
-        "SELECT count(*) FROM dim_rankings WHERE computed_at = %s AND dim = 'rsi_h4'", (_FUTURE,)
-    )[0][0] == 0
+    assert persisted == 0
 
 
 # --------------------------------------------------------------------------
