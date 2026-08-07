@@ -432,6 +432,12 @@ EOW_FLAT_MINUTE_UTC = 30
 SLIPPAGE_P75_LOOKBACK = 200    # newest FILLED rows considered
 SLIPPAGE_P75_MIN_ROWS = 20     # below this the fallback constant stands in
 
+# COMMAND DECK (ops/telegram_bot.py) — the human's handles.
+# How long a dangerous command waits for its CONFIRM. Long enough to type it,
+# short enough that a forgotten confirmation cannot be completed by someone
+# who picks the phone up later.
+COMMAND_CONFIRM_SECONDS = 60
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")

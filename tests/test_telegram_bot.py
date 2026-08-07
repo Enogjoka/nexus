@@ -19,7 +19,33 @@ def _reset_bot(monkeypatch):
     monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", None)
     monkeypatch.setattr(config, "TELEGRAM_CHAT_IDS", None)
     monkeypatch.setattr(telegram_bot, "_warned_disabled", False)
+    telegram_bot._PENDING.clear()
+    # FIX 22.1. audit() writes to command_audit, and the pre-Task-22 tests in
+    # this file predate it — they were silently filling the real audit trail
+    # with chat ids 111/999. Muted by default here; the tests that care about
+    # auditing re-patch it with _capture_audit and inspect the calls instead.
+    monkeypatch.setattr(telegram_bot, "audit", lambda *a, **k: True)
     yield
+    telegram_bot._PENDING.clear()
+
+
+def _mute_audit(monkeypatch):
+    """Silence the audit writer; tests that care about it capture instead."""
+    monkeypatch.setattr(telegram_bot, "audit", lambda *a, **k: True)
+
+
+def _capture_audit(monkeypatch):
+    rows = []
+
+    def fake_audit(chat_id, command, args, outcome, detail=""):
+        rows.append(
+            {"chat_id": chat_id, "command": command, "args": args,
+             "outcome": outcome, "detail": detail}
+        )
+        return True
+
+    monkeypatch.setattr(telegram_bot, "audit", fake_audit)
+    return rows
 
 
 class _FakeResp:
@@ -150,12 +176,22 @@ def test_status_from_allowlisted_chat_replies(monkeypatch):
     assert "stage:" in calls[0]["json"]["text"]
 
 
-def test_non_status_text_is_ignored(monkeypatch):
+def test_unknown_text_gets_the_help_reply(monkeypatch):
+    """
+    Task 22: an unrecognised command answers with help rather than silence.
+    Silence from an ALLOWLISTED chat is indistinguishable from a dead bot, and
+    the operator needs to know the deck is alive. Non-allowlisted chats are
+    still ignored entirely — see the rejection test.
+    """
     _configure(monkeypatch, chats="111")
+    _mute_audit(monkeypatch)
     calls = _capture_post(monkeypatch)
+
     replied = telegram_bot.handle_update({"message": {"chat": {"id": 111}, "text": "hello"}})
-    assert replied is False
-    assert calls == []
+
+    assert replied is True
+    assert len(calls) == 1
+    assert "command deck" in calls[0]["json"]["text"]
 
 
 # --------------------------------------------------------------------------
@@ -244,3 +280,331 @@ def test_poll_loop_error_redacts_token(monkeypatch, caplog):
             telegram_bot.run_telegram_bot()
 
     _no_token_in_records(caplog)
+
+
+# ==========================================================================
+# TASK 22 — the command deck
+#
+# The governing property: no destructive command acts on a single message,
+# and every message is audited whether or not it was allowed to do anything.
+# ==========================================================================
+
+
+def _msg(chat_id, text):
+    return {"message": {"chat": {"id": chat_id}, "text": text}}
+
+
+def _sandbox_kill(monkeypatch, tmp_path):
+    """Never let a test touch the repo's real KILL file."""
+    monkeypatch.setattr(config, "KILL_FILE_PATH", str(tmp_path / "KILL"))
+    return tmp_path / "KILL"
+
+
+# --- reads ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("command", ["/status", "/pods", "/doctrine", "/help"])
+def test_each_read_command_replies_and_audits_ok(monkeypatch, command):
+    _configure(monkeypatch, chats="111")
+    rows = _capture_audit(monkeypatch)
+    calls = _capture_post(monkeypatch)
+
+    assert telegram_bot.handle_update(_msg(111, command)) is True
+    assert len(calls) == 1, "a command replies to exactly one chat"
+    assert calls[0]["json"]["chat_id"] == "111"
+    assert [r["outcome"] for r in rows] == ["OK"]
+    assert rows[0]["command"] == command
+
+
+def test_status_reports_stage_and_the_budget_caveat(monkeypatch):
+    _configure(monkeypatch, chats="111")
+    text = telegram_bot.build_status_text()
+    assert "stage:" in text
+    assert "this process only" in text, "the budget caveat must travel with the number"
+    assert "uptime:" in text
+
+
+def test_status_announces_a_present_kill_file(monkeypatch, tmp_path):
+    kill = _sandbox_kill(monkeypatch, tmp_path)
+    assert "KILL FILE PRESENT" not in telegram_bot.build_status_text()
+    kill.write_text("stop", encoding="utf-8")
+    assert "KILL FILE PRESENT" in telegram_bot.build_status_text()
+
+
+def test_pods_lists_every_configured_pod(monkeypatch):
+    text = telegram_bot.build_pods_text()
+    for pod in config.POD_NAMES:
+        assert pod in text
+
+
+def test_readers_survive_a_dead_database(monkeypatch):
+    """A status command that can crash is useless in the moment you need it."""
+    def boom(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(telegram_bot.database, "fetch", boom)
+    assert "unavailable" in telegram_bot.build_status_text()
+    telegram_bot.build_pods_text()   # must not raise
+
+
+# --- two-step: nothing happens on one message -------------------------------
+
+
+@pytest.mark.parametrize("command", ["/killswitch", "/clearkill", "/flatten"])
+def test_a_dangerous_command_only_asks_first(monkeypatch, tmp_path, command):
+    _configure(monkeypatch, chats="111")
+    kill = _sandbox_kill(monkeypatch, tmp_path)
+    kill.write_text("pre-existing", encoding="utf-8")
+    rows = _capture_audit(monkeypatch)
+    calls = _capture_post(monkeypatch)
+
+    assert telegram_bot.handle_update(_msg(111, command)) is True
+
+    assert "CONFIRM" in calls[0]["json"]["text"]
+    assert rows[0]["outcome"] == "CONFIRM_SENT"
+    assert kill.exists(), "no destructive action may happen on the first message"
+    assert kill.read_text(encoding="utf-8") == "pre-existing"
+
+
+def test_killswitch_writes_the_kill_file_only_after_confirm(monkeypatch, tmp_path):
+    _configure(monkeypatch, chats="111")
+    kill = _sandbox_kill(monkeypatch, tmp_path)
+    rows = _capture_audit(monkeypatch)
+    _capture_post(monkeypatch)
+
+    telegram_bot.handle_update(_msg(111, "/killswitch"))
+    assert not kill.exists()
+
+    telegram_bot.handle_update(_msg(111, "CONFIRM"))
+
+    assert kill.exists(), "CONFIRM must actually write the file the kernel checks"
+    assert "/killswitch" in kill.read_text(encoding="utf-8")
+    assert [r["outcome"] for r in rows] == ["CONFIRM_SENT", "CONFIRMED"]
+    # no temp file survives the atomic write
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".KILL.")] == []
+
+
+def test_clearkill_removes_the_file_after_confirm(monkeypatch, tmp_path):
+    _configure(monkeypatch, chats="111")
+    kill = _sandbox_kill(monkeypatch, tmp_path)
+    kill.write_text("stop", encoding="utf-8")
+    _capture_audit(monkeypatch)
+    calls = _capture_post(monkeypatch)
+
+    telegram_bot.handle_update(_msg(111, "/clearkill"))
+    telegram_bot.handle_update(_msg(111, "CONFIRM"))
+
+    assert not kill.exists()
+    assert "process restart" in calls[-1]["json"]["text"], (
+        "the reply must say a halted kernel does not resume on its own"
+    )
+
+
+def test_flatten_calls_the_router_after_confirm(monkeypatch, tmp_path):
+    _configure(monkeypatch, chats="111")
+    _sandbox_kill(monkeypatch, tmp_path)
+    _capture_audit(monkeypatch)
+    calls = _capture_post(monkeypatch)
+
+    flattened = []
+
+    class FakeRouter:
+        def flatten_all(self, reason):
+            flattened.append(reason)
+            return {"outcome": "CLOSED", "success": True, "closed": 3}
+
+    monkeypatch.setattr(telegram_bot, "_resolve_router", lambda: FakeRouter())
+
+    telegram_bot.handle_update(_msg(111, "/flatten"))
+    assert flattened == [], "no flatten on the first message"
+
+    telegram_bot.handle_update(_msg(111, "CONFIRM"))
+
+    assert flattened == ["telegram /flatten"]
+    assert "3 position(s) closed" in calls[-1]["json"]["text"]
+
+
+def test_flatten_without_a_router_reports_honestly(monkeypatch, tmp_path):
+    _configure(monkeypatch, chats="111")
+    _capture_audit(monkeypatch)
+    calls = _capture_post(monkeypatch)
+    monkeypatch.setattr(telegram_bot, "_resolve_router", lambda: None)
+
+    telegram_bot.handle_update(_msg(111, "/flatten"))
+    telegram_bot.handle_update(_msg(111, "CONFIRM"))
+
+    assert "nothing was flattened" in calls[-1]["json"]["text"]
+
+
+# --- two-step: the confirmation is scoped and time-boxed --------------------
+
+
+def test_a_confirm_from_a_different_chat_is_refused(monkeypatch, tmp_path):
+    """The lever belongs to whoever pulled it, not to whoever is watching."""
+    _configure(monkeypatch, chats="111,222")
+    kill = _sandbox_kill(monkeypatch, tmp_path)
+    rows = _capture_audit(monkeypatch)
+    calls = _capture_post(monkeypatch)
+
+    telegram_bot.handle_update(_msg(111, "/killswitch"))
+    telegram_bot.handle_update(_msg(222, "CONFIRM"))
+
+    assert not kill.exists(), "chat 222 must not be able to complete chat 111's command"
+    assert "Nothing is awaiting confirmation" in calls[-1]["json"]["text"]
+    assert rows[-1]["outcome"] == "REFUSED"
+    assert rows[-1]["chat_id"] == "222"
+
+
+def test_a_confirm_after_the_window_expires(monkeypatch, tmp_path):
+    _configure(monkeypatch, chats="111")
+    kill = _sandbox_kill(monkeypatch, tmp_path)
+    rows = _capture_audit(monkeypatch)
+    calls = _capture_post(monkeypatch)
+
+    telegram_bot.handle_update(_msg(111, "/killswitch"))
+
+    # 61 seconds later.
+    real_monotonic = telegram_bot.time.monotonic
+    monkeypatch.setattr(
+        telegram_bot.time, "monotonic",
+        lambda: real_monotonic() + config.COMMAND_CONFIRM_SECONDS + 1,
+    )
+    telegram_bot.handle_update(_msg(111, "CONFIRM"))
+
+    assert not kill.exists(), "an expired confirmation must not fire"
+    assert "Nothing is awaiting confirmation" in calls[-1]["json"]["text"]
+    outcomes = [r["outcome"] for r in rows]
+    assert "EXPIRED" in outcomes, "the lapse itself must be audited"
+    assert outcomes[-1] == "REFUSED"
+
+
+def test_a_confirm_just_inside_the_window_still_fires(monkeypatch, tmp_path):
+    _configure(monkeypatch, chats="111")
+    kill = _sandbox_kill(monkeypatch, tmp_path)
+    _capture_audit(monkeypatch)
+    _capture_post(monkeypatch)
+
+    telegram_bot.handle_update(_msg(111, "/killswitch"))
+    real_monotonic = telegram_bot.time.monotonic
+    monkeypatch.setattr(
+        telegram_bot.time, "monotonic",
+        lambda: real_monotonic() + config.COMMAND_CONFIRM_SECONDS - 1,
+    )
+    telegram_bot.handle_update(_msg(111, "CONFIRM"))
+
+    assert kill.exists()
+
+
+def test_a_bare_confirm_with_nothing_pending_is_refused(monkeypatch, tmp_path):
+    _configure(monkeypatch, chats="111")
+    _sandbox_kill(monkeypatch, tmp_path)
+    rows = _capture_audit(monkeypatch)
+    _capture_post(monkeypatch)
+
+    telegram_bot.handle_update(_msg(111, "CONFIRM"))
+
+    assert rows[-1]["outcome"] == "REFUSED"
+
+
+def test_a_second_dangerous_command_replaces_the_first(monkeypatch, tmp_path):
+    """
+    One pending confirmation per chat: CONFIRM must never apply to a command
+    the operator has since moved on from.
+    """
+    _configure(monkeypatch, chats="111")
+    kill = _sandbox_kill(monkeypatch, tmp_path)
+    kill.write_text("stop", encoding="utf-8")
+    _capture_audit(monkeypatch)
+    _capture_post(monkeypatch)
+
+    telegram_bot.handle_update(_msg(111, "/killswitch"))
+    telegram_bot.handle_update(_msg(111, "/clearkill"))
+    telegram_bot.handle_update(_msg(111, "CONFIRM"))
+
+    assert not kill.exists(), "CONFIRM applied to /clearkill, the most recent command"
+
+
+# --- the allowlist ----------------------------------------------------------
+
+
+def test_a_non_allowlisted_killswitch_is_ignored_and_audited(monkeypatch, tmp_path):
+    _configure(monkeypatch, chats="111")
+    kill = _sandbox_kill(monkeypatch, tmp_path)
+    rows = _capture_audit(monkeypatch)
+    calls = _capture_post(monkeypatch)
+
+    assert telegram_bot.handle_update(_msg(999, "/killswitch")) is False
+
+    assert calls == [], "never answer a stranger — it confirms the bot exists"
+    assert not kill.exists()
+    assert rows[-1]["outcome"] == "REJECTED"
+    assert rows[-1]["chat_id"] == "999"
+    assert rows[-1]["command"] == "/killswitch"
+
+
+def test_a_stranger_cannot_confirm_an_operators_command(monkeypatch, tmp_path):
+    _configure(monkeypatch, chats="111")
+    kill = _sandbox_kill(monkeypatch, tmp_path)
+    _capture_audit(monkeypatch)
+    _capture_post(monkeypatch)
+
+    telegram_bot.handle_update(_msg(111, "/killswitch"))
+    telegram_bot.handle_update(_msg(999, "CONFIRM"))
+
+    assert not kill.exists()
+
+
+# --- unconfigured regression ------------------------------------------------
+
+
+def test_an_unconfigured_bot_does_nothing_at_all(monkeypatch, tmp_path):
+    """Regression: the no-op contract must survive the command rewrite."""
+    kill = _sandbox_kill(monkeypatch, tmp_path)
+    calls = _capture_post(monkeypatch)
+    _capture_audit(monkeypatch)
+
+    for text in ("/status", "/pods", "/killswitch", "CONFIRM", "/flatten"):
+        assert telegram_bot.handle_update(_msg(111, text)) is False
+
+    assert calls == []
+    assert not kill.exists()
+    assert telegram_bot.send_alert("hi") is False
+
+
+# --- the deck pulls existing levers only ------------------------------------
+
+
+def test_the_bot_never_touches_kernel_internals():
+    """
+    /killswitch writes a FILE the kernel already checks. If the bot ever
+    imported the kernel to set a halt directly, there would be two safety
+    systems, and they would disagree at the worst possible moment.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(telegram_bot))
+    imported = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.append(node.module)
+
+    assert "risk.kernel" not in imported
+
+    # CALL nodes, not raw text: the module docstring names these functions
+    # precisely to explain that it does not call them.
+    banned = {"emergency_flatten", "permit", "_halt"}
+    called = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = getattr(func, "attr", None) or getattr(func, "id", None)
+        if name:
+            called.add(name)
+
+    assert not (called & banned), f"the deck must not call {called & banned}"
+    # ...and the lever it DOES pull is the file the kernel already checks.
+    assert "KILL_FILE_PATH" in inspect.getsource(telegram_bot.write_kill_file)

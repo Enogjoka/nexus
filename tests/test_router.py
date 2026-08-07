@@ -44,6 +44,30 @@ def next_signal(**overrides):
 
 
 @pytest.fixture(autouse=True)
+def _purge_ledger_rows():
+    """
+    FIX 22.1. These tests drive the REAL router, so every submit writes to
+    positions and fills. Left behind, those rows are indistinguishable from
+    trading: /status read 187 synthetic positions back as "$+4320.88 closed
+    today". Every id this file mints starts with NEXUS-<pid>, so a teardown
+    scoped to this process removes exactly what it created and nothing else.
+    """
+    yield
+    if not config.DATABASE_URL:
+        return
+    prefix = f"NEXUS-{os.getpid()}%"
+    pod_prefix = f"NEXUS-S1_FIXFADE-{os.getpid()}%"
+    for table in ("fills", "positions"):
+        for pattern in (prefix, pod_prefix):
+            try:
+                database.execute(
+                    f"DELETE FROM {table} WHERE client_order_id LIKE %s", (pattern,)
+                )
+            except Exception:
+                pass
+
+
+@pytest.fixture(autouse=True)
 def _clean_state():
     saved_market = dict(STATE.market_data)
     saved_ts = STATE.last_analysis_ts
@@ -374,7 +398,11 @@ def test_close_records_a_separate_row_and_preserves_the_open_one():
 
 def test_flatten_all_records_every_open_position():
     bridge = SpyBridge()
-    bridge._book = [{"client_order_id": "NEXUS-A1"}, {"client_order_id": "NEXUS-A2"}]
+    # pid-scoped so the teardown reclaims the -CLOSE rows this writes.
+    bridge._book = [
+        {"client_order_id": f"NEXUS-{os.getpid()}-A1"},
+        {"client_order_id": f"NEXUS-{os.getpid()}-A2"},
+    ]
 
     result = Router(bridge, SpyKernel()).flatten_all("kernel halt")
 

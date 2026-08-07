@@ -45,9 +45,22 @@ class SpyRouter:
 
 @pytest.fixture(autouse=True)
 def _cleanup():
+    """
+    FIX 22.1. Scoped to this process's ids and extended to fills, so a suite
+    run leaves the ledgers exactly as it found them. A positions row that
+    outlives its test is read by /status as a real trade.
+    """
     yield
-    if config.DATABASE_URL:
-        database.execute("DELETE FROM positions WHERE client_order_id LIKE 'TST-%'")
+    if not config.DATABASE_URL:
+        return
+    pattern = f"TST-%-{os.getpid()}-%"
+    for table in ("fills", "positions"):
+        try:
+            database.execute(
+                f"DELETE FROM {table} WHERE client_order_id LIKE %s", (pattern,)
+            )
+        except Exception:
+            pass
 
 
 def seed(cid, **overrides):
