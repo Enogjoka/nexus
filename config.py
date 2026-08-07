@@ -446,6 +446,50 @@ POD_STATS_WINDOW_DAYS = 14
 # what a hallucinating model can add to a report of ground-truth numbers.
 WEEKLY_PROSE_MAX_TOKENS = 800
 
+# PROMOTION (ops/promotion.py) — what you must have EARNED to climb a rung.
+#
+# These are gates, not goals. ops/promotion.py renders a verdict against them
+# and does nothing else: promotion remains a human config edit plus a restart,
+# and no code anywhere may change a stage. The point of writing the criteria
+# down is that a number decided in advance cannot be renegotiated by whoever
+# is impatient at the time.
+#
+# A None threshold makes a row INFORMATIONAL — always shown, never gating.
+PROMOTION_CRITERIA = {
+    # PAPER -> SHADOW: has it run long enough, done enough, and can you stop it?
+    "SHADOW": {
+        "min_pod_trades": 100,
+        "min_swing_signals": 20,
+        "min_soak_days": 14,
+        "max_fallback_pct": 25.0,
+        "kill_drill_within_days": 30,
+    },
+    # SHADOW -> MICRO: the first rung with real money. Everything tightens, and
+    # the edge must be demonstrated rather than hoped for.
+    "MICRO": {
+        "min_shadow_days": 30,
+        "min_pod_trades": 300,
+        "wilson_lb_floor": 0.40,
+        "cost_drag_max_pct": 60.0,
+        "max_drawdown_pct": 8.0,
+        "reconcile_clean_days": 30,
+        "max_fallback_pct": 15.0,
+        "kill_drill_within_days": 30,
+    },
+    # MICRO -> SCALED: size up only on a proven, positive expectancy.
+    "SCALED": {
+        "min_micro_days": 45,
+        "wilson_lb_floor": 0.45,
+        "expectancy_positive": True,
+        "max_drawdown_pct": 6.0,
+        "kill_drill_within_days": 30,
+    },
+}
+
+# Printed into every ELIGIBLE verdict. The wait exists so that the decision to
+# promote and the feeling of wanting to promote are never the same moment.
+COOLING_OFF_HOURS = 48
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
