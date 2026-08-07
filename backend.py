@@ -149,6 +149,14 @@ def build_execution_stack():
         "execution stack ready: bridge=%s kernel=%s router=%s",
         type(_BRIDGE).__name__, type(_KERNEL).__name__, type(_ROUTER).__name__,
     )
+
+    # Task 23: hand the doctrine a way to read pod performance. The dependency
+    # is inverted deliberately — ai/ never imports fusion/, so the doctrine
+    # keeps working if the learning loop is broken or absent. A provider that
+    # raises degrades the prompt to "no pod history" and nothing more.
+    ai.doctrine.set_pod_stats_provider(fusion.learning_loop.pod_stats_snapshot_from_pool)
+    logger.info("doctrine: pod stats provider wired to the learning loop")
+
     return _ROUTER
 
 

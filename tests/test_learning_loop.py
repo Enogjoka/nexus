@@ -85,6 +85,12 @@ def _cleanup():
     if not config.DATABASE_URL:
         return
     database.execute("DELETE FROM dim_rankings WHERE computed_at >= %s", (_CUTOFF,))
+    # Task 23: nightly_job now writes pod_stats too, so the pre-existing tests
+    # that run it through a COMMITTING connection leak year-2099 rows unless
+    # they are purged here alongside dim_rankings.
+    database.execute("DELETE FROM pod_stats WHERE computed_at >= %s", (_CUTOFF,))
+    database.execute("DELETE FROM positions WHERE client_order_id LIKE 'TST_LL-%'")
+    database.execute("DELETE FROM fills WHERE client_order_id LIKE 'TST_LL-%'")
     database.execute("DELETE FROM signals WHERE symbol LIKE 'TST_LL%'")
     database.execute("DELETE FROM state_vectors WHERE ts >= %s", (_CUTOFF,))
     database.execute("DELETE FROM validator_log WHERE symbol LIKE 'TST_LL%'")
@@ -375,3 +381,309 @@ def test_link_failure_never_unmakes_a_persisted_signal(monkeypatch, caplog):
     assert result["outcome"] == "SIGNAL_PERSISTED"  # the signal stands
     assert "link_latest failed" in caplog.text
     database.execute("DELETE FROM signals WHERE id = %s", (result["signal_id"],))
+
+
+# ==========================================================================
+# TASK 23 — pod stats, the doctrine provider, and the weekly narrative
+# ==========================================================================
+
+
+def seed_pod_trades(conn, pod, pnls, costs=None, base=None):
+    """
+    Closed POD positions, optionally with matching FILLED fills rows.
+
+    `costs` is a list parallel to `pnls`; a None entry means NO fills row for
+    that trade, which is how the "absent fills -> NULL costs" path is driven.
+    """
+    base = base or _FUTURE
+    with conn.cursor() as cur:
+        for i, pnl in enumerate(pnls):
+            cid = f"TST_LL-{pod}-{base.isoformat()}-{i}"
+            cur.execute(
+                "INSERT INTO positions (client_order_id, source, pod, direction, lots, "
+                "entry_px, stop_px, state, opened_at, closed_at, realized_pnl_usd) "
+                "VALUES (%s,'POD',%s,'LONG',0.01,4000,3990,'CLOSED',%s,%s,%s)",
+                (cid, pod, base, base + timedelta(hours=i), pnl),
+            )
+            if costs is None:
+                continue
+            spread = costs[i]
+            if spread is None:
+                continue
+            cur.execute(
+                "INSERT INTO fills (ts, client_order_id, direction, lots, spread_at_send, "
+                "slippage, fill_mode, status) "
+                "VALUES (%s,%s,'LONG',0.01,%s,0,'MODELED','FILLED')",
+                (base + timedelta(hours=i), cid, spread),
+            )
+
+
+@contextmanager
+def pod_conn():
+    """Owns positions/fills/pod_stats for one test; never committed."""
+    conn = psycopg2.connect(config.DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM pod_stats")
+            cur.execute("DELETE FROM fills")
+            cur.execute("DELETE FROM positions")
+        yield conn
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+@requires_db
+def test_pod_stats_math_is_hand_computed_with_the_cost_join():
+    """
+    S1: pnls +10, -4, +6, -2  -> n=4, wins=2, gross=+10.00
+        expectancy = 10/4 = 2.50
+        costs: spread 0.35, slippage 0, lots 0.01, commission 7.0/lot
+               = 0.35 * 100 * 0.01 + 7.0 * 0.01 = 0.35 + 0.07 = 0.42 each
+               total = 4 * 0.42 = 1.68
+        cost drag = 1.68 / 10.00 * 100 = 16.8%
+        worst losing streak = 1
+    """
+    with pod_conn() as conn:
+        seed_pod_trades(conn, "S1_FIXFADE", [10.0, -4.0, 6.0, -2.0], costs=[0.35] * 4)
+        summary = loop._step_pod_stats(conn, _FUTURE)
+        row = fetch_on(
+            conn,
+            "SELECT n_trades, wins, expectancy_usd, gross_pnl_usd, total_costs_usd, "
+            "cost_drag_pct, max_consecutive_losses FROM pod_stats WHERE pod='S1_FIXFADE'",
+        )[0]
+
+    assert summary["status"] == "ok"
+    n, wins, expectancy, gross, costs, drag, worst = row
+    assert (n, wins) == (4, 2)
+    assert float(expectancy) == pytest.approx(2.50)
+    assert float(gross) == pytest.approx(10.00)
+    assert float(costs) == pytest.approx(1.68)
+    assert float(drag) == pytest.approx(16.8, abs=0.05)
+    assert worst == 1
+
+
+@requires_db
+def test_a_pod_with_no_trades_still_gets_a_row():
+    """"This pod did nothing for two weeks" is a finding, not an absence."""
+    with pod_conn() as conn:
+        loop._step_pod_stats(conn, _FUTURE)
+        rows = fetch_on(
+            conn, "SELECT pod, n_trades, expectancy_usd FROM pod_stats ORDER BY pod"
+        )
+
+    assert {r[0] for r in rows} == set(config.POD_NAMES)
+    for _pod, n, expectancy in rows:
+        assert n == 0
+        assert expectancy is None, "a pod that never traded has no expectancy to state"
+
+
+@requires_db
+def test_costs_are_null_when_any_fills_row_is_missing():
+    """Never invent a cost — a partial join understates drag, which flatters."""
+    with pod_conn() as conn:
+        seed_pod_trades(conn, "S2_VWAPSNAP", [5.0, -3.0], costs=[0.35, None])
+        loop._step_pod_stats(conn, _FUTURE)
+        row = fetch_on(
+            conn,
+            "SELECT n_trades, gross_pnl_usd, total_costs_usd, cost_drag_pct "
+            "FROM pod_stats WHERE pod='S2_VWAPSNAP'",
+        )[0]
+
+    n, gross, costs, drag = row
+    assert n == 2
+    assert float(gross) == pytest.approx(2.0)
+    assert costs is None, "one missing fills row means costs are unknown, not partial"
+    assert drag is None
+
+
+@requires_db
+def test_trades_outside_the_window_are_excluded():
+    with pod_conn() as conn:
+        old = _FUTURE - timedelta(days=config.POD_STATS_WINDOW_DAYS + 2)
+        seed_pod_trades(conn, "S3_BASIS", [99.0], base=old)
+        loop._step_pod_stats(conn, _FUTURE)
+        row = fetch_on(conn, "SELECT n_trades FROM pod_stats WHERE pod='S3_BASIS'")[0]
+    assert row[0] == 0
+
+
+@requires_db
+def test_pod_stats_runs_as_a_nightly_step():
+    with pod_conn() as conn:
+        seed_pod_trades(conn, "S1_FIXFADE", [1.0], costs=[0.35])
+        summary = loop.nightly_job(conn, _FUTURE)
+    assert summary["steps"]["pod_stats"]["status"] == "ok"
+
+
+# --- the snapshot the doctrine consumes ------------------------------------
+
+
+@requires_db
+def test_snapshot_is_empty_before_anything_is_computed():
+    with pod_conn() as conn:
+        assert loop.pod_stats_snapshot(conn) is None
+
+
+@requires_db
+def test_snapshot_shape_matches_what_the_doctrine_prompt_renders():
+    """
+    INTEGRATION. The contract between the learning loop and the doctrine is a
+    dict shape, and nothing type-checks it — so render a REAL snapshot through
+    the REAL prompt builder and assert the numbers actually appear.
+    """
+    from ai.doctrine import build_doctrine_prompt
+
+    with pod_conn() as conn:
+        seed_pod_trades(conn, "S1_FIXFADE", [10.0, -4.0, 6.0, -2.0], costs=[0.35] * 4)
+        loop._step_pod_stats(conn, _FUTURE)
+        snapshot = loop.pod_stats_snapshot(conn)
+
+    assert snapshot is not None
+    assert snapshot["S1_FIXFADE"]["trades"] == 4
+    assert snapshot["S1_FIXFADE"]["win_rate"] == pytest.approx(0.5)
+
+    prompt = build_doctrine_prompt({"rsi_h1": 55}, snapshot)
+
+    assert "no pod history" not in prompt
+    assert "S1_FIXFADE" in prompt
+    assert "'trades': 4" in prompt, "the numbers must survive into the prompt"
+    assert "'win_rate': 0.5" in prompt
+
+
+@requires_db
+def test_snapshot_takes_the_newest_row_per_pod():
+    with pod_conn() as conn:
+        seed_pod_trades(conn, "S1_FIXFADE", [1.0], costs=[0.35])
+        loop._step_pod_stats(conn, _FUTURE)
+        seed_pod_trades(conn, "S1_FIXFADE", [1.0, 2.0], costs=[0.35, 0.35],
+                        base=_FUTURE + timedelta(hours=5))
+        loop._step_pod_stats(conn, _FUTURE + timedelta(days=1))
+        snapshot = loop.pod_stats_snapshot(conn)
+
+    assert snapshot["S1_FIXFADE"]["trades"] == 3, "the newer computation wins"
+
+
+def test_the_pool_provider_never_raises(monkeypatch):
+    def unavailable(*a, **k):
+        raise RuntimeError("pool exhausted")
+
+    monkeypatch.setattr(database, "get_conn", unavailable)
+    assert loop.pod_stats_snapshot_from_pool() is None
+
+
+# --- the weekly narrative ---------------------------------------------------
+
+
+class _FakeResp:
+    def __init__(self, text):
+        self.content = [type("B", (), {"text": text})()]
+        self.usage = type("U", (), {"input_tokens": 500, "output_tokens": 200})()
+
+
+class _FakeClient:
+    def __init__(self, text=None, error=None):
+        self.text = text
+        self.error = error
+        self.calls = []
+        self.messages = self
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error:
+            raise self.error
+        return _FakeResp(self.text)
+
+
+@requires_db
+def test_weekly_prose_is_appended_verbatim(monkeypatch, _reports_to_tmp):
+    prose = "The desk did nothing this week, and that was correct.\n\nThe single biggest concern is the doctrine's silence."
+    client = _FakeClient(text=prose)
+    monkeypatch.setattr(loop, "_get_client", lambda: client)
+
+    with pod_conn() as conn:
+        path = loop.weekly_report(conn, _FUTURE)
+
+    text = open(path, encoding="utf-8").read()
+    assert "## Desk notes (Fable)" in text
+    assert prose in text, "the narrative must be appended verbatim, not paraphrased"
+    assert client.calls[0]["max_tokens"] == config.WEEKLY_PROSE_MAX_TOKENS
+
+
+@requires_db
+def test_the_report_still_writes_when_the_essayist_is_out(monkeypatch, _reports_to_tmp):
+    """The essayist is a commentator, not a source. The numbers do not need it."""
+    monkeypatch.setattr(loop, "_get_client", lambda: _FakeClient(error=RuntimeError("API down")))
+
+    with pod_conn() as conn:
+        seed_pod_trades(conn, "S1_FIXFADE", [1.0], costs=[0.35])
+        loop._step_pod_stats(conn, _FUTURE)
+        path = loop.weekly_report(conn, _FUTURE)
+
+    text = open(path, encoding="utf-8").read()
+    assert "## Desk notes: unavailable (API)" in text
+    assert "## Desk notes (Fable)" not in text
+    assert "# NEXUS weekly self-report" in text
+    assert "## Pods" in text, "every number must survive the essayist's absence"
+    assert "S1_FIXFADE" in text
+
+
+@requires_db
+def test_prose_is_skipped_when_the_budget_is_spent(monkeypatch, _reports_to_tmp):
+    monkeypatch.setattr(loop.STATE, "budget_spent_today", config.MAX_DAILY_COST + 1)
+
+    def forbidden():
+        raise AssertionError("the budget cap must be checked BEFORE the client is built")
+
+    monkeypatch.setattr(loop, "_get_client", forbidden)
+    assert loop.write_prose("numbers") is None
+
+
+def test_the_prose_prompt_forbids_inventing_numbers():
+    prompt = loop.build_prose_prompt("issued: 0")
+    assert "GROUND TRUTH" in prompt
+    assert "Do NOT invent" in prompt
+    assert "biggest concern" in prompt
+
+
+@requires_db
+def test_prose_cost_is_accumulated_to_the_budget(monkeypatch):
+    monkeypatch.setattr(loop, "_get_client", lambda: _FakeClient(text="ok"))
+    monkeypatch.setattr(loop.STATE, "budget_spent_today", 0.0)
+    loop.write_prose("numbers")
+    assert loop.STATE.budget_spent_today > 0.0
+
+
+# --- doctrine accounting ----------------------------------------------------
+
+
+@requires_db
+def test_doctrine_source_accounting_math(_reports_to_tmp):
+    """
+    3 FABLE (conviction 4/6/8 -> avg 6.0, horizon 30 each = 90 min)
+    2 PARSE_FALLBACK (horizon 15 each = 30 min)
+    fallback share = 30 / 120 = 25.0%
+    """
+    conn = psycopg2.connect(config.DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM doctrines")
+            for conviction in (4, 6, 8):
+                cur.execute(
+                    "INSERT INTO doctrines (ts, bias, conviction, review_horizon_min, "
+                    "source, created_at) VALUES (%s,'BOTH',%s,30,'FABLE',%s)",
+                    (_FUTURE, conviction, _FUTURE),
+                )
+            for _ in range(2):
+                cur.execute(
+                    "INSERT INTO doctrines (ts, bias, conviction, review_horizon_min, "
+                    "source, created_at) VALUES (%s,'FLAT',0,15,'PARSE_FALLBACK',%s)",
+                    (_FUTURE, _FUTURE),
+                )
+        data = loop._collect_weekly(conn, _FUTURE + timedelta(hours=1))
+    finally:
+        conn.rollback()
+        conn.close()
+
+    assert data["doctrine_sources"] == {"FABLE": 3, "PARSE_FALLBACK": 2}
+    assert data["doctrine_avg_conviction"] == pytest.approx(6.0)
+    assert data["doctrine_fallback_pct"] == pytest.approx(25.0)

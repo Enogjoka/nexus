@@ -49,6 +49,7 @@ if __name__ == "__main__":
 
 import config
 from core import database
+from core.state import STATE
 from fusion import rag, regime
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,169 @@ def _step_retrain_regime(conn) -> Dict[str, Any]:
     return {"status": "trained", "rows": model.n_rows, "labels": {str(k): v for k, v in model.labels.items()}}
 
 
+def _pod_costs(conn, window_start: datetime) -> Dict[str, float]:
+    """
+    Round-turn cost per client_order_id, joined from the fills ledger.
+
+    A position with no matching fills row is ABSENT from this map, not zero.
+    The caller must then report NULL costs rather than estimate them: a
+    fabricated cost flows straight into cost_drag_pct and from there into a
+    judgement about whether a strategy pays for itself.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT client_order_id, spread_at_send, slippage, lots FROM fills "
+            "WHERE status = 'FILLED' AND ts >= %s",
+            (window_start,),
+        )
+        rows = cur.fetchall()
+
+    costs: Dict[str, float] = {}
+    for client_order_id, spread, slippage, lots in rows:
+        if spread is None or lots is None:
+            continue
+        lots = float(lots)
+        # Spread is a round-turn cost in a bid/ask quote; observed slippage is
+        # counted on both sides; commission is quoted per lot.
+        slip = abs(float(slippage)) if slippage is not None else 0.0
+        costs[client_order_id] = (
+            (float(spread) + 2.0 * slip) * config.CONTRACT_SIZE_OZ * lots
+            + config.COMMISSION_USD_PER_LOT * lots
+        )
+    return costs
+
+
+def _step_pod_stats(conn, now_utc: datetime) -> Dict[str, Any]:
+    """
+    Per-pod rolling performance over config.POD_STATS_WINDOW_DAYS.
+
+    Every configured pod gets a row, including pods that did nothing: "this
+    strategy has not traded in two weeks" is a finding, and it is invisible if
+    an absence of trades is also an absence of rows.
+    """
+    window_days = config.POD_STATS_WINDOW_DAYS
+    window_start = now_utc - timedelta(days=window_days)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pod, client_order_id, realized_pnl_usd FROM positions "
+            "WHERE source = 'POD' AND state = 'CLOSED' AND closed_at >= %s "
+            "AND pod IS NOT NULL ORDER BY closed_at",
+            (window_start,),
+        )
+        rows = cur.fetchall()
+
+    costs = _pod_costs(conn, window_start)
+
+    by_pod: Dict[str, List[tuple]] = {name: [] for name in config.POD_NAMES}
+    for pod, client_order_id, pnl in rows:
+        by_pod.setdefault(pod, []).append(
+            (client_order_id, float(pnl) if pnl is not None else 0.0)
+        )
+
+    written = 0
+    for pod, trades in by_pod.items():
+        pnls = [pnl for _cid, pnl in trades]
+        n = len(pnls)
+        wins = sum(1 for value in pnls if value > 0)
+
+        # Wilson via the RAG helper — one definition of "how sure are we about
+        # this win rate" across the whole system.
+        stats = rag.wilson_stats([{"outcome_r": value} for value in pnls]) if pnls else None
+        wilson_lb = stats["wilson_lower"] if stats else None
+        gross = sum(pnls) if pnls else None
+        expectancy = (sum(pnls) / n) if n else None
+
+        # Costs only where EVERY trade in the window has a fills row; a partial
+        # join would understate the drag, which is the direction that flatters.
+        known = [costs.get(cid) for cid, _pnl in trades]
+        if n and all(value is not None for value in known):
+            total_costs = sum(known)
+            drag = (total_costs / abs(gross) * 100.0) if gross else None
+        else:
+            total_costs, drag = None, None
+
+        worst = streak = 0
+        for value in pnls:
+            if value <= 0:
+                streak += 1
+                worst = max(worst, streak)
+            else:
+                streak = 0
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO pod_stats (computed_at, pod, window_days, n_trades, wins, "
+                "expectancy_usd, wilson_lb, gross_pnl_usd, total_costs_usd, cost_drag_pct, "
+                "max_consecutive_losses) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (computed_at, pod) DO NOTHING",
+                (now_utc, pod, window_days, n, wins, expectancy, wilson_lb,
+                 gross, total_costs, drag, worst),
+            )
+        written += 1
+
+    logger.info("pod_stats: wrote %d pod row(s) over a %dd window", written, window_days)
+    return {"status": "ok", "pods": written, "window_days": window_days,
+            "trades": len(rows)}
+
+
+def pod_stats_snapshot(conn) -> Optional[Dict[str, Any]]:
+    """
+    Newest pod_stats row per pod, shaped for the doctrine prompt.
+
+    ai/doctrine.py::_render_pod_stats renders each value with str(), so the
+    shape is whatever reads well in a prompt — a compact dict of the numbers
+    that should influence which pods the desk enables. Verified against that
+    function rather than assumed.
+
+    Returns None when nothing has been computed, which the prompt already
+    renders as "no pod history".
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT ON (pod) pod, n_trades, wins, expectancy_usd, wilson_lb, "
+                "cost_drag_pct, max_consecutive_losses, window_days "
+                "FROM pod_stats ORDER BY pod, computed_at DESC"
+            )
+            rows = cur.fetchall()
+    except Exception:
+        logger.warning("pod_stats_snapshot: query failed", exc_info=True)
+        return None
+
+    if not rows:
+        return None
+
+    snapshot: Dict[str, Any] = {}
+    for pod, n, wins, expectancy, wilson, drag, worst, window_days in rows:
+        n = int(n or 0)
+        snapshot[pod] = {
+            "trades": n,
+            "wins": int(wins or 0),
+            "win_rate": round(wins / n, 3) if n else None,
+            "expectancy_usd": round(float(expectancy), 4) if expectancy is not None else None,
+            "wilson_lb": round(float(wilson), 3) if wilson is not None else None,
+            "cost_drag_pct": round(float(drag), 1) if drag is not None else None,
+            "max_consec_losses": int(worst or 0),
+            "window_days": int(window_days or 0),
+        }
+    return snapshot
+
+
+def pod_stats_snapshot_from_pool() -> Optional[Dict[str, Any]]:
+    """
+    Provider entry point for ai.doctrine — checks out its own connection so the
+    doctrine agent needs no ambient one. Never raises: a failure here must
+    degrade the prompt to "no pod history", not break doctrine issuance.
+    """
+    try:
+        with database.get_conn() as conn:
+            return pod_stats_snapshot(conn)
+    except Exception:
+        logger.warning("pod_stats_snapshot_from_pool: unavailable", exc_info=True)
+        return None
+
+
 def nightly_job(conn, now_utc: datetime) -> Dict[str, Any]:
     """
     Run every nightly step in order, each independently survivable, and write
@@ -223,6 +387,7 @@ def nightly_job(conn, now_utc: datetime) -> Dict[str, Any]:
         ("link", lambda: _step_link(conn)),
         ("embed", lambda: _step_embed(conn)),
         ("rank_dims", lambda: _step_rank_dims(conn, now_utc)),
+        ("pod_stats", lambda: _step_pod_stats(conn, now_utc)),
         ("retrain_regime", lambda: _step_retrain_regime(conn)),
     ):
         try:
@@ -245,6 +410,98 @@ def nightly_job(conn, now_utc: datetime) -> Dict[str, Any]:
 # ==========================================================================
 # weekly report
 # ==========================================================================
+
+
+# ==========================================================================
+# the essayist
+# ==========================================================================
+
+
+def _get_client():
+    """
+    Lazy Anthropic client. Its own seam (rather than ai.analysis's) so the
+    weekly prose can use its own token ceiling and so tests monkeypatch one
+    obvious place without touching the analyst.
+    """
+    import anthropic
+
+    return anthropic.Anthropic(
+        api_key=config.ANTHROPIC_API_KEY, timeout=config.ANALYSIS_TIMEOUT_SECONDS
+    )
+
+
+def build_prose_prompt(facts: str) -> str:
+    """
+    The numbers are ground truth; the model's job is to READ them, not to add
+    to them. Every instruction here exists to keep it on that side of the line.
+    """
+    return "\n".join(
+        [
+            "You are the trading desk's own weekly self-review. You are writing",
+            "for the one person who runs this system and already distrusts it.",
+            "",
+            "The numbers below are GROUND TRUTH, computed from the database.",
+            "Do NOT invent, estimate, extrapolate or restate any number that is",
+            "not present. If something important cannot be determined from these",
+            "figures, say that it cannot be determined.",
+            "",
+            "Write at most six short paragraphs of plain prose. No headings, no",
+            "bullet lists, no markdown. Cover: what actually happened, any",
+            "anomaly worth attention, and — as your final paragraph — the SINGLE",
+            "biggest concern, stated plainly.",
+            "",
+            "Do not congratulate. Do not reassure. A week where nothing traded",
+            "is a legitimate finding, not a failure to explain away.",
+            "",
+            "## THE WEEK'S NUMBERS",
+            facts,
+        ]
+    )
+
+
+def write_prose(facts: str) -> Optional[str]:
+    """
+    One guarded Claude call. Returns the prose, or None.
+
+    None is a completely acceptable outcome: weekly_report treats a missing
+    essayist as a missing section, never as a failed report. INVARIANT 6.
+    """
+    if STATE.budget_spent_today > config.MAX_DAILY_COST:
+        logger.error(
+            "weekly prose: daily budget cap reached (spent=$%.4f); skipping the narrative",
+            STATE.budget_spent_today,
+        )
+        return None
+
+    try:
+        client = _get_client()
+        resp = client.messages.create(
+            model=config.ANALYSIS_MODEL,
+            max_tokens=config.WEEKLY_PROSE_MAX_TOKENS,
+            messages=[{"role": "user", "content": build_prose_prompt(facts)}],
+        )
+    except Exception as exc:
+        logger.error("weekly prose: API call failed (%s)", exc)
+        return None
+
+    usage = getattr(resp, "usage", None)
+    input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+    output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    cost = (
+        input_tokens / 1_000_000 * config.ANALYSIS_COST_PER_MTOK_INPUT
+        + output_tokens / 1_000_000 * config.ANALYSIS_COST_PER_MTOK_OUTPUT
+    )
+    STATE.budget_spent_today += cost
+    logger.info(
+        "weekly prose: usage in=%d out=%d est_cost=$%.4f", input_tokens, output_tokens, cost
+    )
+
+    parts = []
+    for block in getattr(resp, "content", None) or []:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+    return "".join(parts).strip() or None
 
 
 def _fmt(value, digits: int = 2) -> str:
@@ -285,6 +542,43 @@ def _collect_weekly(conn, now_utc: datetime) -> Dict[str, Any]:
             )
             dims = cur.fetchall()
 
+        # Doctrine accounting. A brain that is mostly FALLBACK is a finding:
+        # the desk was flat not because it judged flat, but because nobody
+        # answered. Those two look identical in the doctrines table until you
+        # count by source.
+        cur.execute(
+            "SELECT source, count(*) FROM doctrines WHERE created_at >= %s GROUP BY source",
+            (window_start,),
+        )
+        doctrine_sources = {row[0]: int(row[1]) for row in cur.fetchall()}
+
+        cur.execute(
+            "SELECT avg(conviction) FROM doctrines "
+            "WHERE created_at >= %s AND source = 'FABLE'",
+            (window_start,),
+        )
+        avg_conviction = cur.fetchone()[0]
+
+        # Horizon-hours spent in a fallback posture, as a share of all
+        # horizon-hours issued. review_horizon_min weights each doctrine by how
+        # long it was meant to govern, so a 15-minute fallback does not count
+        # the same as a 120-minute one.
+        cur.execute(
+            "SELECT COALESCE(SUM(review_horizon_min) FILTER "
+            "  (WHERE source <> 'FABLE'), 0)::float, "
+            "COALESCE(SUM(review_horizon_min), 0)::float "
+            "FROM doctrines WHERE created_at >= %s",
+            (window_start,),
+        )
+        fallback_min, total_min = cur.fetchone()
+
+        cur.execute(
+            "SELECT DISTINCT ON (pod) pod, n_trades, wins, expectancy_usd, wilson_lb, "
+            "cost_drag_pct, max_consecutive_losses FROM pod_stats "
+            "ORDER BY pod, computed_at DESC"
+        )
+        pod_rows = cur.fetchall()
+
     return {
         "window_start": window_start,
         "issued": issued,
@@ -292,6 +586,12 @@ def _collect_weekly(conn, now_utc: datetime) -> Dict[str, Any]:
         "rule_counts": rule_counts,
         "dims": dims,
         "dims_computed_at": latest,
+        "doctrine_sources": doctrine_sources,
+        "doctrine_avg_conviction": float(avg_conviction) if avg_conviction is not None else None,
+        "doctrine_fallback_pct": (
+            (fallback_min / total_min * 100.0) if total_min else None
+        ),
+        "pod_rows": pod_rows,
     }
 
 
@@ -405,6 +705,55 @@ def weekly_report(conn, now_utc: datetime) -> str:
         "cost accounting is not yet built.",
         "",
     ]
+
+    # ---- pods
+    lines += ["## Pods", "",
+              "| pod | trades | wins | expectancy | wilson LB | cost drag | worst streak |",
+              "|---|---|---|---|---|---|---|"]
+    if data["pod_rows"]:
+        for pod, n, wins, expectancy, wilson, drag, worst in data["pod_rows"]:
+            lines.append(
+                f"| {pod} | {int(n or 0)} | {int(wins or 0)} | "
+                f"${_fmt(float(expectancy) if expectancy is not None else None, 4)} | "
+                f"{_fmt(float(wilson) if wilson is not None else None, 3)} | "
+                f"{_fmt(float(drag) if drag is not None else None, 1)}% | {int(worst or 0)} |"
+            )
+    else:
+        lines.append("| _no pod stats computed yet_ | — | — | — | — | — | — |")
+    lines.append("")
+
+    # ---- doctrine accounting
+    sources = data["doctrine_sources"]
+    total_doctrines = sum(sources.values()) if sources else 0
+    lines += ["## Doctrine", "",
+              f"| Doctrines issued | {total_doctrines} |", "|---|---|"]
+    for source in sorted(sources):
+        lines.append(f"| {source} | {sources[source]} |")
+    lines.append(f"| Avg conviction (FABLE) | {_fmt(data['doctrine_avg_conviction'], 1)} |")
+    lines.append(f"| Horizon-hours on fallback | {_fmt(data['doctrine_fallback_pct'], 1)}% |")
+    lines.append("")
+    if (data["doctrine_fallback_pct"] or 0) > 50:
+        lines += [
+            "> More than half of this week's governed time ran on a FALLBACK "
+            "doctrine. The desk was flat because nobody answered, not because "
+            "it judged flat — those are different problems.",
+            "",
+        ]
+
+    # ---- the narrative, last, and never load-bearing
+    facts = "\n".join(lines)
+    prose = write_prose(facts)
+    if prose:
+        lines += ["## Desk notes (Fable)", "", prose, ""]
+    else:
+        lines += [
+            "## Desk notes: unavailable (API)",
+            "",
+            "The narrative call did not return. Every number above is unaffected — "
+            "the report is computed from the database and the essayist is a "
+            "commentator, not a source.",
+            "",
+        ]
 
     path = os.path.join(_reports_dir(), f"weekly-{now_utc.date().isoformat()}.md")
     return _atomic_write(path, "\n".join(lines))

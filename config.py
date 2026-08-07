@@ -438,6 +438,14 @@ SLIPPAGE_P75_MIN_ROWS = 20     # below this the fallback constant stands in
 # who picks the phone up later.
 COMMAND_CONFIRM_SECONDS = 60
 
+# LEARNING v7 (fusion/learning_loop.py) — the desk studying its own pods.
+# Two weeks is long enough for a scalp pod to accumulate a readable sample and
+# short enough that a regime change does not stay averaged in forever.
+POD_STATS_WINDOW_DAYS = 14
+# The weekly narrative is a summary, not an essay. A tight ceiling also caps
+# what a hallucinating model can add to a report of ground-truth numbers.
+WEEKLY_PROSE_MAX_TOKENS = 800
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")

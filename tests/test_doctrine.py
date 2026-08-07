@@ -683,3 +683,83 @@ def test_doctrine_imports_nothing_from_analysis_or_risk():
     for module in imported:
         assert module != "ai.analysis", "must not import ai.analysis"
         assert not module.startswith("risk"), f"must not import {module}"
+
+
+# ==========================================================================
+# TASK 23 ADDITIONS — the pod-stats provider hook
+#
+# Everything above this line is Tasks 15/15-fix and is untouched; the proof is
+# `git diff main -- tests/test_doctrine.py` showing zero deleted lines.
+# ==========================================================================
+
+
+@pytest.fixture(autouse=True)
+def _clear_provider():
+    """No test may leak a provider into another."""
+    doc.set_pod_stats_provider(None)
+    yield
+    doc.set_pod_stats_provider(None)
+
+
+def test_no_provider_means_no_pod_history():
+    """The Task 15 behaviour, unchanged when nothing is installed."""
+    assert doc.current_pod_stats() is None
+    assert "no pod history" in doc.build_doctrine_prompt({"rsi_h1": 55}, doc.current_pod_stats())
+
+
+def test_an_installed_provider_supplies_the_stats():
+    stats = {"S1_FIXFADE": {"trades": 12, "win_rate": 0.58}}
+    doc.set_pod_stats_provider(lambda: stats)
+
+    assert doc.current_pod_stats() == stats
+
+
+def test_a_raising_provider_degrades_to_no_history(caplog):
+    """A broken learning loop must never stop the desk from having a view."""
+    caplog.set_level(logging.INFO, logger="ai.doctrine")
+
+    def boom():
+        raise RuntimeError("pool exhausted")
+
+    doc.set_pod_stats_provider(boom)
+
+    assert doc.current_pod_stats() is None
+    assert "provider raised" in caplog.text
+    assert "no pod history" in doc.build_doctrine_prompt({}, doc.current_pod_stats())
+
+
+def test_the_provider_reaches_the_issued_prompt(monkeypatch):
+    """
+    End to end: install a provider, issue a doctrine, and assert the pod
+    numbers actually arrived in the prompt the model was sent.
+    """
+    stats = {"S1_FIXFADE": {"trades": 41, "win_rate": 0.61, "expectancy_usd": 0.34}}
+    doc.set_pod_stats_provider(lambda: stats)
+
+    client = FakeClient(text=json.dumps(valid_payload()))
+    monkeypatch.setattr(doc, "_get_client", lambda: client)
+
+    doc.issue_doctrine({"rsi_h1": 55}, NOW, doc.current_pod_stats())
+
+    sent = client.calls[0]["messages"][0]["content"]
+    assert "no pod history" not in sent
+    assert "'trades': 41" in sent
+    assert "'win_rate': 0.61" in sent
+
+
+def test_the_provider_hook_is_installable_and_clearable():
+    doc.set_pod_stats_provider(lambda: {"S1_FIXFADE": {"trades": 1}})
+    assert doc.current_pod_stats() is not None
+    doc.set_pod_stats_provider(None)
+    assert doc.current_pod_stats() is None
+
+
+def test_the_agent_consults_the_provider_when_issuing():
+    """
+    The one modified line in ai/doctrine.py. Read the source rather than run
+    the agent loop, which never returns.
+    """
+    import inspect
+
+    source = inspect.getsource(doc.run_doctrine_agent)
+    assert "issue_doctrine(state, now, current_pod_stats())" in source

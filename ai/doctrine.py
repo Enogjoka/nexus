@@ -234,6 +234,42 @@ def _render_pod_stats(pod_stats: Optional[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+# Task 23: the pod-stats provider hook.
+#
+# fusion/learning_loop.py computes per-pod performance, but ai/ must not import
+# fusion/ to fetch it — the doctrine has to keep working with the learning loop
+# absent or broken. So the dependency is inverted: backend.py installs a
+# provider at boot, and this module only ever calls whatever it was handed.
+#
+# Nothing here fails loudly. A missing or raising provider yields None, which
+# build_doctrine_prompt already renders as "no pod history" — the exact
+# behaviour that shipped in Task 15.
+_POD_STATS_PROVIDER = None
+
+
+def set_pod_stats_provider(provider) -> None:
+    """Install the callable that supplies per-pod stats. None clears it."""
+    global _POD_STATS_PROVIDER
+    _POD_STATS_PROVIDER = provider
+    logger.info("doctrine: pod stats provider %s", "installed" if provider else "cleared")
+
+
+def current_pod_stats() -> Optional[Dict[str, Any]]:
+    """
+    Ask the provider, guarded. Returns None when there is no provider or it
+    fails — a broken learning loop must never stop the desk from having a view.
+    """
+    provider = _POD_STATS_PROVIDER
+    if provider is None:
+        return None
+    try:
+        return provider()
+    except Exception:
+        logger.warning("doctrine: pod stats provider raised; prompting without history",
+                       exc_info=True)
+        return None
+
+
 def build_doctrine_prompt(state: Dict[str, Any], pod_stats: Optional[Dict[str, Any]] = None) -> str:
     """
     The head-of-desk brief. Deliberately contains no price levels and no order
@@ -682,7 +718,11 @@ def run_doctrine_agent() -> None:
                 score = triage(state_delta(state, last_issued_state), now)
 
             if cadence_due or score >= config.TRIAGE_THRESHOLD:
-                doctrine = issue_doctrine(state, now)
+                # Task 23: the ONE modified line. current_pod_stats() is
+                # guarded and returns None when no provider is installed, so
+                # this is identical to the previous call until backend.py
+                # wires the learning loop in.
+                doctrine = issue_doctrine(state, now, current_pod_stats())
                 HOLDER.set(doctrine)
                 last_issued_at = now
                 last_issued_state = state
