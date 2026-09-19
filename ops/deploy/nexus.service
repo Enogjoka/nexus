@@ -1,0 +1,71 @@
+# NEXUS brain — systemd unit for the Frankfurt VPS.
+#
+# Install: ops/deploy/RUNBOOK-FRANKFURT.md, step (g).
+# This file contains NO secrets. Every credential arrives through
+# EnvironmentFile, which is written by hand on the server and never in git.
+
+[Unit]
+Description=NEXUS gold trading system (brain)
+Documentation=file:///home/nexus/nexus/ops/deploy/RUNBOOK-FRANKFURT.md
+
+# The corpus lives in the local Postgres. Without it backend.py exits 1 by
+# design ("a brain with no memory must not pretend to run"), so start after it.
+# Wants, not Requires: a Postgres restart must not take NEXUS down with it —
+# the kernel fails closed on its own while the database is away.
+Wants=network-online.target postgresql.service
+After=network-online.target postgresql.service
+
+# Five starts inside ten minutes and systemd stops trying. A trader that is
+# crash-looping is not recovering, it is repeating its failure — and every
+# restart re-runs boot: migrations, a fresh kernel, a new doctrine call. It
+# stays down until a human has read the journal:
+#     sudo systemctl reset-failed nexus && sudo systemctl start nexus
+# (These two keys belong in [Unit]; systemd ignores them under [Service].)
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=nexus
+Group=nexus
+WorkingDirectory=/home/nexus/nexus
+
+# Secrets, typed by hand in runbook step (e). backend.py also calls
+# load_dotenv() on this same file; python-dotenv never overrides a value that
+# is already set, so these values win and both readers agree — provided the
+# file holds plain KEY=value lines (no quotes, no `export`, no inline comments).
+EnvironmentFile=/home/nexus/nexus/.env
+
+# Line-at-a-time output, so the journal shows each event when it happens.
+Environment=PYTHONUNBUFFERED=1
+
+# The venv lives OUTSIDE the checkout, so `git status` on the server stays
+# clean and a `git clean` can never delete the interpreter.
+ExecStart=/home/nexus/venv/bin/python backend.py
+
+# backend.py installs its own SIGTERM handler: it logs "shutting down", stops
+# the supervisor and exits 0. Thirty seconds is ample; after that, SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# on-failure restarts after a crash (any non-zero exit, including the exit 1
+# for "database unreachable at boot") and NEVER after a clean stop — a
+# deliberate `systemctl stop` stays stopped.
+Restart=on-failure
+RestartSec=10
+
+# All output to journald:  journalctl -u nexus -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nexus
+
+# Conservative hardening, chosen because it cannot break a Python app that
+# writes only under /home/nexus (the KILL and DEMOTED flag files, reports/,
+# and yfinance's cache in ~/.cache). Tighten to ProtectSystem=strict plus
+# ReadWritePaths=/home/nexus only after the service has run clean for a week.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

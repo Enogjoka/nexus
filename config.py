@@ -490,6 +490,28 @@ PROMOTION_CRITERIA = {
 # promote and the feeling of wanting to promote are never the same moment.
 COOLING_OFF_HOURS = 48
 
+# DEPLOY (ops/deploy/preflight.py) — what a server must prove before NEXUS
+# boots on it. Kept beside the SECRETS block below on purpose: a secret added
+# there and forgotten here would be a key the preflight never asks about.
+PREFLIGHT_MIN_PYTHON = (3, 12)
+PREFLIGHT_MIN_FREE_GB = 5.0
+# Keys some running agent actually reads. Presence is checked, values never.
+PREFLIGHT_REQUIRED_ENV = [
+    "DATABASE_URL",
+    "ANTHROPIC_API_KEY",
+    "FRED_API_KEY",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_IDS",
+    # Read only by link/ today, which is not wired. Required anyway: the
+    # runbook generates it fresh on the server, and the exec box will need the
+    # same value the day it joins.
+    "HMAC_SECRET",
+]
+# Defined below but read by no agent. Reported, never required.
+PREFLIGHT_OPTIONAL_ENV = ["OPENAI_API_KEY", "GEMINI_API_KEY", "FINNHUB_API_KEY"]
+# The only stage a migration may land at. Promotion is a separate, earned act.
+PREFLIGHT_REQUIRED_STAGE = "PAPER"
+
 # SECRETS — always os.environ.get, never literals. Nothing here is ever
 # written back to the environment, to the database, or to git.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
