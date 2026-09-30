@@ -102,6 +102,9 @@ OFFERED_ANCHORS = [
 # guard (STATE.budget_spent_today) — approximate, not a billing source of truth.
 ANALYSIS_COST_PER_MTOK_INPUT = 3.0
 ANALYSIS_COST_PER_MTOK_OUTPUT = 15.0
+# Task A1: at most one Telegram alert per API-failure category (credit / auth /
+# rate) per this many minutes. Other failures are logged only.
+API_ALERT_COOLDOWN_MINUTES = 60
 
 # PAPER ENGINE (exec_/paper_engine.py)
 PAPER_TTL_HOURS = 24  # a PENDING signal older than this expires unfilled

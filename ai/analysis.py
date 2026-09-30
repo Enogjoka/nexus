@@ -18,18 +18,27 @@ never raw prices. INVARIANT 6 is upheld: the one external call (Claude) is
 timeout-wrapped, try/except-guarded, and logs every failure before returning
 None. A None anywhere downstream means WAIT — no trade.
 
-Clock discipline: `datetime.now()` appears ONLY in run_scheduler(). Every
-other function that needs the time takes `utc_now` as an argument, so the
-whole spine is deterministic under test.
+The doctrine binds this path (Task A1). The first step of every cycle reads
+the posture in force; FLAT, expired/absent, swing disallowed or a zero risk
+multiplier ends the cycle before a prompt is built. `bias` filters direction
+and `risk_multiplier` scales risk down — never up. A doctrine that cannot be
+read is treated as FLAT.
+
+Clock discipline: `datetime.now()` drives trading decisions ONLY in
+run_scheduler(). Every other decision function takes `utc_now` as an
+argument, so the whole spine is deterministic under test. The one other
+clock read is _utcnow(), used solely for operational bookkeeping in
+call_claude (API-alert cooldown, last successful model call).
 """
 import json
 import logging
 import math
 import threading
 from datetime import date, datetime, timedelta, timezone
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import config
+from ai import doctrine as _doctrine  # import only: ai/doctrine.py is UNTOUCHABLE
 from ai.price_resolver import (
     ResolvedSignal,
     SignalAnchors,
@@ -39,6 +48,7 @@ from ai.price_resolver import (
 )
 from core import database
 from core.state import BUS, STATE
+from ops.telegram_bot import send_alert
 from risk.sizing import position_size
 from risk.validator import Verdict, validate
 
@@ -55,6 +65,14 @@ _last_cycle_at: Optional[datetime] = None
 # cycle's `utc_now` argument (never datetime.now()), since call_claude may not
 # hold a clock.
 _budget_day: Optional[date] = None
+
+# API-failure alert cooldown: category -> when its last alert was attempted.
+_alert_lock = threading.Lock()
+_last_alert_at: Dict[str, datetime] = {}
+
+# Failure categories that page the operator. "other" (timeouts, 5xx, shape
+# errors) is logged only: the scheduler cadence is the retry.
+_ALERT_CATEGORIES = ("credit", "auth", "rate")
 
 
 # ==========================================================================
@@ -202,6 +220,54 @@ def _response_text(resp) -> Optional[str]:
     return "".join(parts) if parts else None
 
 
+def _utcnow() -> datetime:
+    """Operational clock for call_claude's bookkeeping only (see module doc)."""
+    return datetime.now(timezone.utc)
+
+
+def _classify_api_error(exc: BaseException) -> str:
+    """
+    credit (message mentions "credit balance"; checked first because the
+    Anthropic API reports it as a 400), auth (401/403), rate (429), other.
+    """
+    if "credit balance" in str(exc).lower():
+        return "credit"
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in (401, 403):
+        return "auth"
+    if status == 429:
+        return "rate"
+    return "other"
+
+
+def _maybe_alert(category: str, exc: BaseException) -> None:
+    """
+    Send ONE Telegram alert per category per config.API_ALERT_COOLDOWN_MINUTES.
+    The cooldown slot is claimed before sending, so a failing Telegram cannot
+    turn every analysis cycle into a send attempt. Never raises.
+    """
+    if category not in _ALERT_CATEGORIES:
+        return
+    now = _utcnow()
+    cooldown = timedelta(minutes=config.API_ALERT_COOLDOWN_MINUTES)
+    with _alert_lock:
+        last = _last_alert_at.get(category)
+        if last is not None and now - last < cooldown:
+            return
+        _last_alert_at[category] = now
+    text = (
+        f"NEXUS analyst: model API failing [{category}] — {str(exc)[:200]}. "
+        "No swing signals until it recovers. "
+        f"Next alert for this category in >= {config.API_ALERT_COOLDOWN_MINUTES} min."
+    )
+    try:
+        send_alert(text)
+    except Exception:
+        logger.error("call_claude: send_alert raised for category=%s", category, exc_info=True)
+
+
 def call_claude(prompt: str) -> Optional[str]:
     """
     Send `prompt` to Claude and return the raw text reply, or None (WAIT).
@@ -210,10 +276,13 @@ def call_claude(prompt: str) -> Optional[str]:
       * Daily budget cap: if STATE.budget_spent_today already exceeds
         config.MAX_DAILY_COST, return None WITHOUT calling the API.
       * Any API failure (timeout, APIError, connection error, unexpected
-        shape) is logged at error level and returns None. No retries — the
+        shape) is classified (credit / auth / rate / other), logged at error
+        level and returns None. credit/auth/rate also alert the operator on
+        Telegram, at most once per category per cooldown. No retries — the
         scheduler cadence is the retry (INVARIANT 6).
     On success, the response's token usage is turned into an estimated cost,
-    logged, and accumulated into STATE.budget_spent_today.
+    logged, and accumulated into STATE.budget_spent_today, and
+    STATE.last_model_success_at is stamped.
     """
     if STATE.budget_spent_today > config.MAX_DAILY_COST:
         logger.error(
@@ -231,8 +300,18 @@ def call_claude(prompt: str) -> Optional[str]:
             messages=[{"role": "user", "content": prompt}],
         )
     except Exception as exc:
-        logger.error("call_claude: API call failed (%s); returning None", exc, exc_info=True)
+        category = _classify_api_error(exc)
+        logger.error(
+            "call_claude: API call failed [category=%s] (%s); returning None",
+            category,
+            exc,
+            exc_info=True,
+        )
+        _maybe_alert(category, exc)
         return None
+
+    # Dynamic AppState attribute (core/state.py is not edited).
+    STATE.last_model_success_at = _utcnow()
 
     usage = getattr(resp, "usage", None)
     input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
@@ -363,6 +442,57 @@ def _reset_budget_if_new_day(utc_now: datetime) -> None:
         _budget_day = day
 
 
+def _doctrine_block_reason(d: Any) -> Optional[str]:
+    """
+    Which condition, if any, forbids a swing signal under doctrine `d`.
+    Anything that is not positively permissive blocks — an unreadable field
+    counts as forbidding (fail closed).
+    """
+    if getattr(d, "bias", "FLAT") == "FLAT":
+        return "bias FLAT"
+    if getattr(d, "swing_signals_allowed", False) is not True:
+        return "swing_signals_allowed False"
+    multiplier = getattr(d, "risk_multiplier", 0.0)
+    if not isinstance(multiplier, (int, float)) or not multiplier > 0:
+        return "risk_multiplier <= 0"
+    return None
+
+
+def _doctrine_ts(d: Any) -> Optional[str]:
+    ts = getattr(d, "ts", None)
+    return ts.isoformat() if isinstance(ts, datetime) else None
+
+
+def _doctrine_blocked(d: Any, reason: str, utc_now: datetime) -> dict:
+    """
+    Record the block as ONE validator_log row at the cycle's own `utc_now`
+    (the correlation key) and return the DOCTRINE_BLOCKED outcome. A failed
+    audit write is logged and the cycle stays blocked.
+    """
+    details = {
+        "bias": getattr(d, "bias", None),
+        "swing_signals_allowed": getattr(d, "swing_signals_allowed", None),
+        "risk_multiplier": getattr(d, "risk_multiplier", None),
+        "doctrine_ts": _doctrine_ts(d),
+        "reason": reason,
+    }
+    try:
+        with database.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO validator_log (ts, symbol, rule_name, rule_result, details) "
+                    "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                    (utc_now, config.YF_SYMBOL, "DOCTRINE_GATE", "WAIT", json.dumps(details, default=str)),
+                )
+    except Exception:
+        logger.error(
+            "run_analysis_cycle: could not write DOCTRINE_GATE row; cycle stays blocked",
+            exc_info=True,
+        )
+    logger.info("run_analysis_cycle: outcome=DOCTRINE_BLOCKED reason=%s", reason)
+    return {"outcome": "DOCTRINE_BLOCKED", "reason": reason}
+
+
 def _persist_signal(
     state: dict,
     sig: SignalAnchors,
@@ -371,6 +501,7 @@ def _persist_signal(
     meta: dict,
     lots: float,
     utc_now: datetime,
+    doctrine_fields: Optional[dict] = None,
 ) -> int:
     """
     Write the issued signal to the signals table and return its id.
@@ -416,6 +547,8 @@ def _persist_signal(
             "sized_lots": lots,
         }
     )
+    if doctrine_fields:
+        market_snapshot.update(doctrine_fields)  # doctrine_ts, doctrine_bias, risk_multiplier
 
     with database.get_conn() as conn:
         with conn.cursor() as cur:
@@ -444,14 +577,29 @@ def _persist_signal(
     return signal_id
 
 
-def run_analysis_cycle(state: dict, utc_now: datetime) -> dict:
+def run_analysis_cycle(state: dict, utc_now: datetime, holder=None) -> dict:
     """
     The full spine for one analysis attempt. Returns a dict whose "outcome"
     names exactly where the attempt ended. Every step is logged. Nothing in
     here calls datetime.now(); the clock arrives as `utc_now`.
+
+    `holder` is the DoctrineHolder to consult; None means ai.doctrine.HOLDER.
+    The doctrine read here is the one applied to the whole cycle.
     """
-    _reset_budget_if_new_day(utc_now)
     logger.info("run_analysis_cycle: start utc_now=%s", utc_now.isoformat())
+
+    # 0. doctrine gate — before the prompt is built and before any Claude call
+    active_holder = holder if holder is not None else _doctrine.HOLDER
+    try:
+        doctrine = active_holder.current(utc_now)
+    except Exception:
+        logger.error("run_analysis_cycle: doctrine unreadable; treating as FLAT", exc_info=True)
+        return _doctrine_blocked(None, "doctrine unreadable", utc_now)
+    block_reason = _doctrine_block_reason(doctrine)
+    if block_reason is not None:
+        return _doctrine_blocked(doctrine, block_reason, utc_now)
+
+    _reset_budget_if_new_day(utc_now)
 
     # 1. anchors + live price
     anchor_map = build_anchor_map(state)
@@ -475,6 +623,14 @@ def run_analysis_cycle(state: dict, utc_now: datetime) -> dict:
         logger.warning("run_analysis_cycle: outcome=REJECTED_MALFORMED")
         return {"outcome": "REJECTED_MALFORMED"}
 
+    # 3b. doctrine direction filter
+    if (doctrine.bias == "LONG_ONLY" and sig.direction != "LONG") or (
+        doctrine.bias == "SHORT_ONLY" and sig.direction != "SHORT"
+    ):
+        return _doctrine_blocked(
+            doctrine, f"direction {sig.direction} against bias {doctrine.bias}", utc_now
+        )
+
     # 4. resolve anchors -> concrete prices
     resolved = resolve(sig, anchor_map, live_price)
     if resolved is None:
@@ -488,15 +644,23 @@ def run_analysis_cycle(state: dict, utc_now: datetime) -> dict:
         logger.info("run_analysis_cycle: outcome=VALIDATOR_WAIT reasons=%s", verdict.reasons)
         return {"outcome": "VALIDATOR_WAIT", "verdict": verdict}
 
-    # 6. position size
-    lots = position_size(config.ACCOUNT_SIZE, config.MAX_RISK_PCT, resolved.risk_per_unit)
+    # 6. position size — the doctrine's risk_multiplier can only shrink risk
+    risk_pct = min(config.MAX_RISK_PCT, config.MAX_RISK_PCT * doctrine.risk_multiplier)
+    lots = position_size(config.ACCOUNT_SIZE, risk_pct, resolved.risk_per_unit)
     if lots == 0.0:
         logger.info("run_analysis_cycle: outcome=SIZED_ZERO")
         return {"outcome": "SIZED_ZERO"}
 
     # 7. persist
+    doctrine_fields = {
+        "doctrine_ts": _doctrine_ts(doctrine),
+        "doctrine_bias": doctrine.bias,
+        "risk_multiplier": doctrine.risk_multiplier,
+    }
     try:
-        signal_id = _persist_signal(state, sig, resolved, verdict, meta, lots, utc_now)
+        signal_id = _persist_signal(
+            state, sig, resolved, verdict, meta, lots, utc_now, doctrine_fields
+        )
     except Exception:
         logger.error("run_analysis_cycle: persist failed; outcome=PERSIST_FAILED", exc_info=True)
         return {"outcome": "PERSIST_FAILED"}

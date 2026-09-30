@@ -31,6 +31,7 @@ import pytest
 
 import config
 from ai import analysis
+from ai.doctrine import Doctrine, DoctrineHolder
 from ai.price_resolver import ResolvedSignal, SignalAnchors
 from core import database
 from core.state import STATE
@@ -349,7 +350,13 @@ def test_cycle_links_the_persisted_signal(monkeypatch):
                "indicators": {"ema20": 4095.0, "rsi14": 52.0, "swing_low": 4050.0}},
         "1d": {"price": 4100.0, "stale": False, "regime": "RANGE", "indicators": {"rsi14": 50.0}},
     }
-    result = analysis.run_analysis_cycle(state, datetime(2099, 6, 1, 8, 0, tzinfo=timezone.utc))
+    cycle_now = datetime(2099, 6, 1, 8, 0, tzinfo=timezone.utc)
+    holder = DoctrineHolder(persist=False)
+    holder.set(Doctrine(
+        ts=cycle_now, bias="BOTH", conviction=5, risk_multiplier=1.0,
+        swing_signals_allowed=True, review_horizon_min=120,
+    ))
+    result = analysis.run_analysis_cycle(state, cycle_now, holder=holder)
 
     assert result["outcome"] == "SIGNAL_PERSISTED"
     assert calls == [result["signal_id"]]  # linked with the freshly-persisted id
@@ -375,8 +382,14 @@ def test_link_failure_never_unmakes_a_persisted_signal(monkeypatch, caplog):
                "indicators": {"ema20": 4095.0, "rsi14": 52.0, "swing_low": 4050.0}},
         "1d": {"price": 4100.0, "stale": False, "regime": "RANGE", "indicators": {"rsi14": 50.0}},
     }
+    cycle_now = datetime(2099, 6, 1, 8, 0, tzinfo=timezone.utc)
+    holder = DoctrineHolder(persist=False)
+    holder.set(Doctrine(
+        ts=cycle_now, bias="BOTH", conviction=5, risk_multiplier=1.0,
+        swing_signals_allowed=True, review_horizon_min=120,
+    ))
     with caplog.at_level(logging.WARNING):
-        result = analysis.run_analysis_cycle(state, datetime(2099, 6, 1, 8, 0, tzinfo=timezone.utc))
+        result = analysis.run_analysis_cycle(state, cycle_now, holder=holder)
 
     assert result["outcome"] == "SIGNAL_PERSISTED"  # the signal stands
     assert "link_latest failed" in caplog.text
