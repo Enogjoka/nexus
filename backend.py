@@ -31,16 +31,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import json
 import logging
 import signal
+import sys
 import threading
 import time
 from collections import deque
-from typing import Callable, Deque, Dict, Iterable, List, NamedTuple, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable, Deque, Dict, Iterable, List, NamedTuple, Optional
 
 import config
 from config import get_stage
 from core import database
+from core.state import STATE
 
 # Agent entry points. Importing these pulls in every agent module; an import
 # failure here is fatal by design — a half-started trading system is worse
@@ -121,6 +125,89 @@ AGENTS: List[Agent] = [
 ]
 
 _RESTART_WINDOW_SECONDS = 3600.0
+
+# Sensor freshness for the ops heartbeat: name -> (table, column). The three
+# tables without a `ts` column are measured by fetched_at (plan F-44).
+HEARTBEAT_SENSORS = {
+    "candles": ("candles", "ts"),
+    "state_vectors": ("state_vectors", "ts"),
+    "macro_observations": ("macro_observations", "ts"),
+    "cot_reports": ("cot_reports", "fetched_at"),
+    "econ_events": ("econ_events", "fetched_at"),
+    "news_articles": ("news_articles", "fetched_at"),
+}
+
+
+def rss_mb() -> Optional[float]:
+    """
+    This process's resident memory in MB. Current RSS from /proc/self/status
+    (Linux, i.e. production). Elsewhere the stdlib only offers the PEAK
+    (resource.ru_maxrss: KB on Linux, bytes on macOS). None if neither works.
+    """
+    try:
+        with open("/proc/self/status") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024.0, 1)
+    except OSError:
+        pass
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        divisor = 1024.0 * 1024.0 if sys.platform == "darwin" else 1024.0
+        return round(peak / divisor, 1)
+    except Exception:
+        return None
+
+
+def later(a: Optional[datetime], b: Optional[datetime]) -> Optional[datetime]:
+    """The later of two optional timestamps; None only when both are None."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a >= b else b
+
+
+def _last_market_update_at() -> Optional[datetime]:
+    """
+    When market data was last refreshed. data/gold_agent.py stamps
+    STATE.last_analysis_ts (epoch seconds, despite the name) right before it
+    publishes market_update. None when it has never run.
+    """
+    raw = getattr(STATE, "last_analysis_ts", None)
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return datetime.fromtimestamp(raw, tz=timezone.utc)
+    return None
+
+
+def _query_one(cur, sql: str, params=()) -> Optional[tuple]:
+    """
+    One read inside the heartbeat transaction, isolated by a savepoint so a
+    missing table or column yields None instead of aborting the transaction.
+    """
+    cur.execute("SAVEPOINT hb_read")
+    try:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+    except Exception:
+        cur.execute("ROLLBACK TO SAVEPOINT hb_read")
+        logger.debug("ops heartbeat: read failed: %s", sql, exc_info=True)
+        return None
+    cur.execute("RELEASE SAVEPOINT hb_read")
+    return row
+
+
+def _age_s(now: datetime, then: Optional[datetime]) -> Optional[int]:
+    return int((now - then).total_seconds()) if isinstance(then, datetime) else None
+
+
+def prune_heartbeats(cur, now: datetime) -> None:
+    """Delete ops_heartbeats rows older than config.HEARTBEAT_RETENTION_DAYS."""
+    cutoff = now - timedelta(days=config.HEARTBEAT_RETENTION_DAYS)
+    cur.execute("DELETE FROM ops_heartbeats WHERE ts < %s", (cutoff,))
+    logger.info("ops heartbeat: pruned %d rows older than %s", cur.rowcount, cutoff.isoformat())
 
 
 def configure_logging() -> None:
@@ -218,7 +305,13 @@ class Supervisor:
         poll_seconds: Optional[float] = None,
         max_restarts_per_hour: Optional[int] = None,
         heartbeat_telegram_hours: Optional[float] = None,
+        ops_heartbeat: bool = False,
     ) -> None:
+        """
+        `ops_heartbeat` turns on the per-poll ops_heartbeats row and the
+        model-silence alert. main() turns it on; constructing a Supervisor
+        elsewhere (the supervision tests) writes nothing to the database.
+        """
         self.agents: List[Agent] = list(AGENTS if agents is None else agents)
         for agent in self.agents:
             if agent.kind not in _KINDS:
@@ -249,6 +342,15 @@ class Supervisor:
         # is due one full interval after start, so restarting the process is
         # not a way to spam the operator.
         self._last_telegram = time.monotonic()
+
+        # Ops heartbeat (Task O1). State below is touched only by the single
+        # heartbeat thread (at most one runs at a time).
+        self.ops_heartbeat = ops_heartbeat
+        self._ops_thread: Optional[threading.Thread] = None
+        self._boot_utc = datetime.now(timezone.utc)
+        self._last_prune_day: Optional[date] = None
+        self._model_silent = False
+        self._silence_alert_at: Optional[datetime] = None
 
     # -- thread plumbing ---------------------------------------------------
 
@@ -378,7 +480,155 @@ class Supervisor:
             len(self.agents),
         )
         self._maybe_telegram_heartbeat(counts)
+        self._start_ops_heartbeat(counts)
         return counts
+
+    # -- ops heartbeat (Task O1) ---------------------------------------------
+
+    def _start_ops_heartbeat(self, counts: Dict[str, int]) -> None:
+        """
+        Fire-and-forget: the heartbeat runs on its own daemon thread, so a
+        slow or hung database can never delay this loop (INVARIANT 6). If the
+        previous heartbeat is still running, this poll's is skipped rather
+        than piling up threads.
+        """
+        if not self.ops_heartbeat:
+            return
+        try:
+            previous = self._ops_thread
+            if previous is not None and previous.is_alive():
+                logger.warning("ops heartbeat: previous write still running; skipping this poll")
+                return
+            thread = threading.Thread(
+                target=self._ops_heartbeat,
+                args=(dict(counts),),
+                name="nexus-ops-heartbeat",
+                daemon=True,
+            )
+            self._ops_thread = thread
+            thread.start()
+        except Exception:
+            logger.error("ops heartbeat: could not start the heartbeat thread", exc_info=True)
+
+    def wait_ops_heartbeat(self, timeout: float = 5.0) -> None:
+        """Join the in-flight heartbeat thread, if any. For shutdown and tests."""
+        thread = self._ops_thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+
+    def _ops_heartbeat(self, counts: Dict[str, int], now: Optional[datetime] = None) -> Optional[int]:
+        """
+        Write one ops_heartbeats row, prune once per UTC day, then check for
+        model silence. Returns the new row id, or None when the write failed.
+        Never raises.
+        """
+        now = now or datetime.now(timezone.utc)
+        model_ok_at = getattr(STATE, "last_model_success_at", None)
+        model_ok_known = False  # True once the doctrines side has been read
+        row_id = None
+        try:
+            with database.get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SET LOCAL statement_timeout = %s",
+                        (int(config.HEARTBEAT_STATEMENT_TIMEOUT_MS),),
+                    )
+                    fable = _query_one(
+                        cur, "SELECT max(ts) FROM doctrines WHERE source = 'FABLE'"
+                    )
+                    if fable is not None:
+                        model_ok_at = later(model_ok_at, fable[0])
+                        model_ok_known = True
+
+                    newest = _query_one(
+                        cur, "SELECT ts, bias, source FROM doctrines ORDER BY ts DESC LIMIT 1"
+                    )
+                    doctrine_ts, doctrine_bias, doctrine_source = newest or (None, None, None)
+
+                    sensors: Dict[str, Optional[int]] = {}
+                    for name, (table, column) in HEARTBEAT_SENSORS.items():
+                        # Identifiers come from the constant map above, never input.
+                        freshest = _query_one(cur, f"SELECT max({column}) FROM {table}")
+                        sensors[name] = _age_s(now, freshest[0] if freshest else None)
+
+                    cur.execute(
+                        """
+                        INSERT INTO ops_heartbeats
+                            (ts, stage, alive, registered, dead, rss_mb,
+                             last_market_update_at, model_ok_at, doctrine_bias,
+                             doctrine_source, doctrine_age_s, budget_today_usd, sensors)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                        RETURNING id
+                        """,
+                        (
+                            now,
+                            get_stage().value,
+                            counts.get("alive"),
+                            counts.get("registered"),
+                            counts.get("dead"),
+                            rss_mb(),
+                            _last_market_update_at(),
+                            model_ok_at,
+                            doctrine_bias,
+                            doctrine_source,
+                            _age_s(now, doctrine_ts),
+                            float(getattr(STATE, "budget_spent_today", 0.0) or 0.0),
+                            json.dumps(sensors),
+                        ),
+                    )
+                    row_id = cur.fetchone()[0]
+
+                    if self._last_prune_day != now.date():
+                        # Claimed before running: a failing prune is retried
+                        # tomorrow, not every 30 seconds.
+                        self._last_prune_day = now.date()
+                        cur.execute("SAVEPOINT hb_prune")
+                        try:
+                            prune_heartbeats(cur, now)
+                        except Exception:
+                            cur.execute("ROLLBACK TO SAVEPOINT hb_prune")
+                            logger.error("ops heartbeat: prune failed", exc_info=True)
+        except Exception:
+            row_id = None
+            logger.error("ops heartbeat: write failed; supervision continues", exc_info=True)
+
+        if not model_ok_known:
+            # Half the evidence is missing: an in-process timestamp alone
+            # would raise false "AI dead" alarms while the doctrine gate keeps
+            # the analyst quiet. No guess; the next poll tries again.
+            logger.warning("ops heartbeat: model_ok_at unknown (doctrines unreadable); silence check skipped")
+            return row_id
+        try:
+            self._check_model_silence(model_ok_at, now)
+        except Exception:
+            logger.error("ops heartbeat: model-silence check failed", exc_info=True)
+        return row_id
+
+    def _check_model_silence(self, model_ok_at: Optional[datetime], now: datetime) -> None:
+        """
+        Alert once when no AI call has succeeded for MODEL_SILENCE_ALERT_MINUTES
+        (measured from boot while there has never been one), repeat at most
+        once per that interval, and send one recovery message when it clears.
+        """
+        threshold = timedelta(minutes=config.MODEL_SILENCE_ALERT_MINUTES)
+        reference = model_ok_at if model_ok_at is not None else self._boot_utc
+        silence = now - reference
+        if silence > threshold:
+            if self._silence_alert_at is None or now - self._silence_alert_at >= threshold:
+                self._silence_alert_at = now
+                self._model_silent = True
+                minutes = int(silence.total_seconds() // 60)
+                self._notify(
+                    f"NEXUS: no successful AI call for {minutes}m - check Anthropic credits/API"
+                )
+            return
+        if self._model_silent:
+            self._notify(
+                "NEXUS: AI calls recovered - last successful call "
+                f"{model_ok_at.strftime('%Y-%m-%d %H:%M UTC')}"
+            )
+        self._model_silent = False
+        self._silence_alert_at = None
 
     def _maybe_telegram_heartbeat(self, counts: Dict[str, int]) -> None:
         if self.heartbeat_telegram_seconds <= 0:
@@ -424,7 +674,7 @@ def main() -> int:
     # Ring 0 exists before any agent does.
     build_execution_stack()
 
-    supervisor = Supervisor()
+    supervisor = Supervisor(ops_heartbeat=True)
     signal.signal(signal.SIGINT, supervisor.request_stop)
     signal.signal(signal.SIGTERM, supervisor.request_stop)
 

@@ -258,6 +258,10 @@ REPORTS_DIR = "./reports"
 SUPERVISOR_POLL_SECONDS = 30   # thread-liveness poll interval
 MAX_RESTARTS_PER_HOUR = 4      # per agent; on the next failure the supervisor gives up
 HEARTBEAT_TELEGRAM_HOURS = 12  # /status-style summary cadence; 0 disables
+# Task O1: backend.py writes one ops_heartbeats row per supervisor poll.
+HEARTBEAT_RETENTION_DAYS = 14      # ops_heartbeats rows older than this are pruned once a day
+HEARTBEAT_STATEMENT_TIMEOUT_MS = 5000  # per-statement cap inside the heartbeat transaction
+MODEL_SILENCE_ALERT_MINUTES = 120  # no successful AI call for this long -> Telegram alert (and its repeat interval)
 
 # STAGE GOVERNOR (risk/stage.py) — the ladder as enforceable machinery.
 # The Stage enum and get_stage() at the top of this file are the mechanism;
