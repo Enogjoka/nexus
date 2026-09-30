@@ -1,0 +1,27 @@
+# NEXUS Observatory — its own dependencies, installed into its own venv
+# (/home/observatory/venv on the server). The trading requirements.txt is
+# separate and untouched.
+#
+# Full pinned closure, resolved 2026-09-30 on Python 3.14 (dev iMac). Direct
+# dependencies first; everything below them is what they pull in.
+#   /home/observatory/venv/bin/pip install -r requirements-observatory.txt
+fastapi==0.142.2
+uvicorn==0.54.0
+psycopg2-binary==2.9.12
+httpx==0.28.1  # tests only (FastAPI TestClient)
+
+# transitive
+annotated-doc==0.0.5
+annotated-types==0.7.0
+anyio==4.13.0
+certifi==2026.2.25
+click==8.3.1
+h11==0.16.0
+httpcore==1.0.9
+idna==3.11
+opentelemetry-api==1.45.0
+pydantic==2.13.4
+pydantic-core==2.46.4
+starlette==1.7.0
+typing-extensions==4.15.0
+typing-inspection==0.4.2

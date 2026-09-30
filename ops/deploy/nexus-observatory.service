@@ -1,0 +1,71 @@
+# NEXUS Observatory — read-only API — systemd unit for the Frankfurt VPS.
+#
+# NOT INSTALLED BY TASK O2. Committed for review; the operator installs it later.
+#
+# Isolation from the trading process, by construction:
+#   * its own OS user (observatory), its own read-only checkout, its own venv
+#     and its own EnvironmentFile. It shares nothing with nexus.service;
+#   * it connects to Postgres only as the SELECT-only `observatory` role
+#     (ops/deploy/readonly_roles.sql), and every session is read-only;
+#   * MemoryMax caps it so it can never starve the trading process on the
+#     shared 2 GB droplet.
+#
+# One-time setup (as root; no secret ever goes into git or chat):
+#   adduser --system --group --home /home/observatory observatory
+#   sudo -u observatory git clone <repo> /home/observatory/nexus
+#   sudo -u observatory python3 -m venv /home/observatory/venv
+#   sudo -u observatory /home/observatory/venv/bin/pip install \
+#        -r /home/observatory/nexus/requirements-observatory.txt
+#   Write /home/observatory/observatory.env by hand, mode 600, owner observatory:
+#        OBSERVATORY_DATABASE_URL=postgresql://observatory@/nexus
+#        OBSERVATORY_TOKEN=<openssl rand -hex 32>
+#        OBSERVATORY_BIND=<Tailscale address; never 0.0.0.0>
+#        OBSERVATORY_PORT=8787
+#   (plain KEY=value lines: no quotes, no `export`). If the role has a
+#   password, set it with \password in psql and put it in the URL only in
+#   this file.
+#   cp nexus-observatory.service /etc/systemd/system/ && systemctl daemon-reload
+#   systemctl enable --now nexus-observatory
+#
+# Logs: journalctl -u nexus-observatory -f   (access log is off: the WebSocket
+# may carry its token in the query string, which must never reach a log)
+
+[Unit]
+Description=NEXUS Observatory (read-only API)
+Wants=network-online.target postgresql.service
+After=network-online.target postgresql.service
+# A crash-looping API is not recovering; stop after 5 starts in 10 minutes.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=observatory
+Group=observatory
+WorkingDirectory=/home/observatory/nexus
+EnvironmentFile=/home/observatory/observatory.env
+Environment=PYTHONUNBUFFERED=1
+
+# Missing OBSERVATORY_DATABASE_URL or OBSERVATORY_TOKEN -> exit 2 with a
+# clear message: an unauthenticated observatory is no observatory.
+ExecStart=/home/observatory/venv/bin/python -m observatory.api
+
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+MemoryMax=200M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nexus-observatory
+
+# It only ever reads its checkout and its env file, and writes nothing.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
