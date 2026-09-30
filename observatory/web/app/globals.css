@@ -1,0 +1,80 @@
+@import "tailwindcss";
+
+/* NEXUS Observatory — dark trading-desk terminal.
+   Semantic colours are fixed across every screen: profit green, loss red,
+   warning amber, and one colour per ring. */
+@theme {
+  --color-bg: #080b10;
+  --color-panel: #0e1219;
+  --color-panel2: #131923;
+  --color-line: #1d2531;
+  --color-line2: #283243;
+  --color-ink: #e6e9ef;
+  --color-muted: #8f98a8;
+  --color-faint: #5d6778;
+
+  --color-profit: #22c55e;
+  --color-loss: #ef4444;
+  --color-warn: #f59e0b;
+  --color-flat: #9ca3af;
+  --color-entry: #e6e9ef;
+
+  --color-ring0: #f472b6;
+  --color-ring1: #38bdf8;
+  --color-ring2: #a78bfa;
+  --color-ring3: #2dd4bf;
+
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --animate-node-pulse: node-pulse 1.6s ease-out infinite;
+  --animate-blink: blink 1.4s ease-in-out infinite;
+
+  @keyframes node-pulse {
+    0% { transform: scale(1); opacity: 0.75; }
+    100% { transform: scale(2.4); opacity: 0; }
+  }
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+}
+
+html {
+  background: var(--color-bg);
+  color-scheme: dark;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  /* Tabular numerals everywhere: columns of prices and R line up. */
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1, "cv11" 1;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* Thin, quiet scrollbars for dense panels. */
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line2) transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -722,3 +722,126 @@ def test_missing_heartbeat_table_is_reported_not_raised():
 
     out = queries.heartbeats(NoHeartbeats(), datetime.now(timezone.utc), 60)
     assert out["rows"] is None and "migration 017" in out["missing"]
+
+
+# ==========================================================================
+# Task O3 — the static web app shell served by the API
+# ==========================================================================
+
+STATIC = PACKAGE / "static"
+TEXT_SUFFIXES = {".html", ".js", ".css", ".txt", ".json", ".webmanifest", ".svg"}
+
+
+def _static_client():
+    return TestClient(_offline_app())
+
+
+def test_the_web_build_is_committed():
+    for name in ("index.html", "agents.html", "trades.html", "404.html", "manifest.webmanifest",
+                 "icons/icon-192.png", "icons/icon-512.png", "apple-touch-icon.png"):
+        assert (STATIC / name).is_file(), name
+
+
+@pytest.mark.parametrize("path", ["/", "/agents", "/trades"])
+def test_the_shell_loads_without_a_token(path):
+    response = _static_client().get(path)
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "<html" in response.text
+    assert response.headers["cache-control"] == "no-store"
+    csp = response.headers["content-security-policy"]
+    assert "connect-src 'self'" in csp and "worker-src 'none'" in csp
+
+
+def test_api_routes_still_need_the_token_next_to_the_shell():
+    client = _static_client()
+    for path in ("/api/v1/state", "/api/v1/trades", "/api/v1/events", "/api/v1/perf"):
+        response = client.get(path)
+        assert response.status_code == 401, path
+        assert response.headers["content-type"].startswith("application/json"), path
+
+
+@pytest.mark.parametrize("path", ["/api", "/api/", "/api/v1/nope", "/api/v2/state", "/ws", "/ws/events", "/ws/other"])
+def test_api_and_ws_paths_are_never_shadowed_by_the_shell(path):
+    response = _static_client().get(path)
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("application/json")
+    assert "<html" not in response.text
+
+
+def test_the_websocket_still_answers_behind_the_shell():
+    projector = Projector(ReadOnlyDB("dbname=never_opened"))
+    projector._publish([{"ts": None, "ring": 0, "agent": "kernel", "event_type": "kernel_deny", "severity": "error",
+                         "correlation_id": None, "trade_id": None, "summary": "Kernel DENY", "payload": {}}])
+    app = build_app(SETTINGS, db=ReadOnlyDB("dbname=never_opened"), projector=projector, start_projector=False)
+    client = TestClient(app)
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/ws/events") as ws:
+            ws.receive_json()
+    with client.websocket_connect(f"/ws/events?since_id=0&token={TOKEN}") as ws:
+        assert ws.receive_json()["summary"] == "Kernel DENY"
+
+
+def test_assets_manifest_and_route_payloads_are_served():
+    client = _static_client()
+    chunk = next((STATIC / "_next" / "static" / "chunks").glob("*.js"))
+    response = client.get(f"/_next/static/chunks/{chunk.name}")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/javascript")
+    assert "immutable" in response.headers["cache-control"]
+
+    manifest = client.get("/manifest.webmanifest")
+    assert manifest.status_code == 200
+    assert manifest.headers["content-type"].startswith("application/manifest+json")
+    body = manifest.json()
+    assert body["display"] == "standalone" and body["start_url"] == "/"
+
+    assert client.get("/agents.txt").status_code == 200  # client-side navigation payload
+    assert client.get("/apple-touch-icon.png").headers["content-type"] == "image/png"
+
+
+def test_unknown_paths_get_the_app_404_page():
+    response = _static_client().get("/no-such-screen")
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("text/html")
+
+
+@pytest.mark.parametrize("path", ["/%2e%2e/api.py", "/..%2fapi.py", "/%2e%2e/%2e%2e/config.py", "/static/../api.py"])
+def test_the_shell_cannot_escape_its_directory(path):
+    response = _static_client().get(path)
+    assert response.status_code == 404
+    assert "def build_app" not in response.text and "import " not in response.text  # no source file leaked
+
+
+def _static_text_files():
+    return [p for p in STATIC.rglob("*") if p.is_file() and p.suffix in TEXT_SUFFIXES]
+
+
+def test_the_build_contains_no_token_and_no_mock():
+    files = _static_text_files()
+    assert files, "observatory/static is empty"
+    secrets_to_find = {TOKEN}
+    if os.environ.get("OBSERVATORY_TOKEN"):
+        secrets_to_find.add(os.environ["OBSERVATORY_TOKEN"])
+    hex_run = re.compile(r"[0-9a-fA-F]{32,}")                      # openssl rand -hex / token_hex
+    bearer_literal = re.compile(r"Bearer [A-Za-z0-9._~+/=-]{16,}")  # only `Bearer ${token}` is allowed
+    mock = re.compile(r"\bmock", re.IGNORECASE)
+    offenders = []
+    for path in files:
+        text = path.read_text(errors="ignore")
+        name = str(path.relative_to(STATIC))
+        if any(secret in text for secret in secrets_to_find):
+            offenders.append(f"{name}: contains a token")
+        if hex_run.search(text):
+            offenders.append(f"{name}: 32+ hex characters")
+        if bearer_literal.search(text):
+            offenders.append(f"{name}: literal bearer credential")
+        if mock.search(text):
+            offenders.append(f"{name}: the word mock")
+    assert offenders == []
+
+
+def test_the_build_registers_no_service_worker():
+    for path in _static_text_files():
+        assert "serviceWorker" not in path.read_text(errors="ignore"), path.name
+    assert not any(p.name in ("sw.js", "service-worker.js") for p in STATIC.rglob("*"))

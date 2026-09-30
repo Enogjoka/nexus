@@ -10,12 +10,22 @@ The Observatory API — GET only, bearer-token auth, no write path anywhere.
     GET /api/v1/perf?window=day|week|all
     GET /api/v1/heartbeats?minutes=
     WS  /ws/events                     pushes new events
+    GET /  and any other path          the static web app shell (no auth, no data)
 
 Auth: `Authorization: Bearer <token>`, compared in constant time. The query
 parameter `token=` is accepted ONLY on the WebSocket, because browsers cannot
 set headers on a WebSocket handshake; uvicorn's access log is therefore off,
 so that query string is never written to a log. Any method other than GET/HEAD
 is answered 405 before routing. CORS is off. OpenAPI/docs pages are off.
+
+Static web app (Task O3): observatory/static holds the committed Next.js build.
+It is served for every path that is NOT under /api or /ws, without auth,
+because it contains no data: the app asks for the token and every data call it
+makes goes through the token-protected routes above. Resolution follows the
+Next.js static-export convention (file, file.html, dir/index.html, else the
+app's 404.html with status 404). A path under /api or /ws never falls through
+to the shell. HTML is never cached; hashed assets are immutable; a Content
+Security Policy keeps the page on this origin and forbids service workers.
 
 Run:  python -m observatory.api      (reads OBSERVATORY_* from the environment)
 """
@@ -26,11 +36,12 @@ import sys
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal, Optional
 
 import psycopg2
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.websockets import WebSocketDisconnect
 
 from . import queries
@@ -43,6 +54,34 @@ logger = logging.getLogger("observatory.api")
 _ALLOWED_METHODS = ("GET", "HEAD")
 WS_PUSH_INTERVAL_S = 1.0
 WS_BATCH_LIMIT = 200
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+_RESERVED_PREFIXES = ("/api", "/ws")
+_MEDIA_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+    ".json": "application/json",
+    ".webmanifest": "application/manifest+json",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".svg": "image/svg+xml",
+    ".woff2": "font/woff2",
+}
+_STATIC_HEADERS = {
+    # Everything the page may load or contact is on this origin; no service
+    # worker may ever be registered (stale trading data must not look live).
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; manifest-src 'self'; "
+        "worker-src 'none'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+}
 
 
 def _utcnow() -> datetime:
@@ -67,6 +106,35 @@ class ReadOnlyMethods:
         await self.app(scope, receive, send)
 
 
+def _is_reserved(url_path: str) -> bool:
+    return any(url_path == p or url_path.startswith(p + "/") for p in _RESERVED_PREFIXES)
+
+
+def _resolve_static(root: Path, rel: str) -> Optional[Path]:
+    """The file for a request path, or None. Never escapes `root`."""
+    if "\x00" in rel:
+        return None
+    rel = rel.strip("/")
+    candidates = ["index.html"] if not rel else [rel, f"{rel}.html", f"{rel}/index.html"]
+    for candidate in candidates:
+        path = (root / candidate).resolve()
+        if path.is_file() and (path == root or root in path.parents):
+            return path
+    return None
+
+
+def _static_response(root: Path, path: Path, status_code: int = 200) -> FileResponse:
+    headers = dict(_STATIC_HEADERS)
+    parts = path.relative_to(root).parts
+    if parts[:2] == ("_next", "static"):
+        headers["Cache-Control"] = "public, max-age=31536000, immutable"  # content-hashed names
+    elif path.suffix in (".html", ".txt", ".webmanifest"):
+        headers["Cache-Control"] = "no-store"
+    else:
+        headers["Cache-Control"] = "public, max-age=3600"
+    return FileResponse(path, status_code=status_code, media_type=_MEDIA_TYPES.get(path.suffix), headers=headers)
+
+
 def _token_matches(presented: Optional[str], expected: str) -> bool:
     if not presented:
         return False
@@ -86,6 +154,7 @@ def build_app(
     projector: Optional[Projector] = None,
     start_projector: bool = True,
     clock=_utcnow,
+    static_dir: Optional[Path] = None,
 ) -> FastAPI:
     """Assemble the app. Raises SettingsError when the environment is incomplete."""
     settings = settings or load_settings()
@@ -211,6 +280,23 @@ def build_app(
                     return
         except WebSocketDisconnect:
             return
+
+    # The web app shell. Registered LAST, so every API and WebSocket route is
+    # matched first; and it refuses anything under /api or /ws outright, so an
+    # unknown API path answers 404 JSON, never the shell.
+    static_root = (static_dir or STATIC_DIR).resolve()
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def web_app(path: str):
+        if _is_reserved("/" + path):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        found = _resolve_static(static_root, path)
+        if found is not None:
+            return _static_response(static_root, found)
+        fallback = static_root / "404.html"
+        if fallback.is_file():
+            return _static_response(static_root, fallback, status_code=404)
+        return JSONResponse({"error": "not found"}, status_code=404)
 
     return app
 
