@@ -845,3 +845,225 @@ def test_the_build_registers_no_service_worker():
     for path in _static_text_files():
         assert "serviceWorker" not in path.read_text(errors="ignore"), path.name
     assert not any(p.name in ("sw.js", "service-worker.js") for p in STATIC.rglob("*"))
+
+
+# ==========================================================================
+# Task O2b — the agent action log through the observatory
+# ==========================================================================
+
+O2B = "TST_O2B"
+
+
+def _log(seed, ts, agent, level, message, logger_name="test", thread="pytest"):
+    return seed.add("agent_log", ts=ts, agent=agent, logger=logger_name, level=level, message=message, thread=thread)
+
+
+def _backend_agent_names():
+    """The agent names in backend.AGENT_LOGGER_MAP, read from source (importing
+    backend would import every trading module)."""
+    tree = ast.parse((REPO / "backend.py").read_text())
+    names = set()
+    for node in tree.body:
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+        ids = {getattr(t, "id", None) for t in targets}
+        if "AGENT_LOGGER_MAP" in ids:
+            names |= {v.value for v in node.value.values}
+        if "AGENT_OTHER" in ids:
+            names.add(node.value.value)
+    return names
+
+
+def test_known_agents_match_the_backend_map():
+    backend_names = _backend_agent_names()
+    assert "Price feed" in backend_names and "Other" in backend_names  # the parse found the map
+    assert set(queries.KNOWN_AGENTS) == backend_names
+    assert all(ring in (0, 1, 2, 3) for _, ring in queries.AGENTS)
+
+
+def test_agents_report_status_and_list_silent_agents_as_never_seen(obs_db, seed):
+    now = datetime(2001, 5, 6, 12, 0, tzinfo=timezone.utc)  # a clock with no other agent_log rows before it
+    _log(seed, now - timedelta(minutes=10), "Validator", "ERROR", f"{O2B} validator write failed")
+    _log(seed, now - timedelta(minutes=40), "Validator", "INFO", f"{O2B} validator pass")
+    _log(seed, now - timedelta(minutes=30), "News", "INFO", f"{O2B} fetched 12 articles")
+    _log(seed, now - timedelta(hours=3), "Calendar", "INFO", f"{O2B} calendar refreshed")
+    _log(seed, now - timedelta(hours=20), "Calendar", "WARNING", f"{O2B} calendar slow")
+    _log(seed, now + timedelta(minutes=5), "Kernel", "INFO", f"{O2B} after the clock: invisible")
+
+    report = queries.agents(obs_db, now)
+    by_name = {a["agent"]: a for a in report["agents"]}
+    assert set(queries.KNOWN_AGENTS) <= set(by_name)  # silent agents are listed too
+
+    assert by_name["Validator"]["status"] == "failing"
+    assert by_name["Validator"]["counts_1h"] == {"ERROR": 1, "INFO": 1}
+    assert by_name["Validator"]["last_message"] == f"{O2B} validator write failed"
+    assert by_name["News"]["status"] == "active"
+    assert by_name["Calendar"]["status"] == "quiet"
+    assert by_name["Calendar"]["counts_1h"] == {}
+    assert by_name["Calendar"]["counts_24h"] == {"INFO": 1, "WARNING": 1}
+    assert by_name["Calendar"]["last_ts"] == (now - timedelta(hours=3)).isoformat()
+    assert by_name["Kernel"]["status"] == "never seen" and by_name["Kernel"]["last_ts"] is None
+    assert by_name["Telegram"]["status"] == "never seen"
+    assert (by_name["Validator"]["ring"], by_name["News"]["ring"], by_name["Kernel"]["ring"]) == (2, 3, 0)
+
+
+def test_agent_log_pages_newest_first(obs_db, seed):
+    agent = f"{O2B} pager"  # a name only this test uses
+    t0 = datetime(2001, 6, 1, tzinfo=timezone.utc)
+    ids = [_log(seed, t0 + timedelta(minutes=i), agent, "INFO", f"{O2B} page row {i}") for i in range(5)]
+
+    now = datetime.now(timezone.utc)
+    first = queries.agent_log(obs_db, now, agent, limit=2)
+    assert [r["id"] for r in first["rows"]] == [ids[4], ids[3]]
+    assert first["next_before_id"] == ids[3]
+    second = queries.agent_log(obs_db, now, agent, limit=2, before_id=first["next_before_id"])
+    assert [r["id"] for r in second["rows"]] == [ids[2], ids[1]]
+    third = queries.agent_log(obs_db, now, agent, limit=2, before_id=second["next_before_id"])
+    assert [r["id"] for r in third["rows"]] == [ids[0]]
+    assert third["next_before_id"] is None
+
+    assert queries.agent_log(obs_db, now, f"{O2B} nobody", limit=10) is None  # never used: unknown
+    assert queries.agent_log(obs_db, now, f"{O2B} nobody", limit=10, before_id=5) is None  # paging does not change that
+    silent = queries.agent_log(obs_db, now, "Telegram", limit=10)  # known, maybe silent: never None
+    assert silent is not None
+    future = _log(seed, now + timedelta(days=1), agent, "INFO", f"{O2B} from the future")
+    assert future not in [r["id"] for r in queries.agent_log(obs_db, now, agent, limit=10)["rows"]]  # F-38
+
+    client = TestClient(build_app(SETTINGS, db=obs_db, projector=Projector(obs_db), start_projector=False))
+    response = client.get(f"/api/v1/agents/{agent}/log", params={"limit": 2}, headers=AUTH)
+    assert response.status_code == 200
+    assert [r["id"] for r in response.json()["rows"]] == [ids[4], ids[3]]
+    assert client.get(f"/api/v1/agents/{O2B} nobody/log", headers=AUTH).status_code == 404
+    assert client.get(f"/api/v1/agents/{O2B} nobody/log?before_id=5", headers=AUTH).status_code == 404
+    assert client.get("/api/v1/agents/Kern%00el/log", headers=AUTH).status_code == 422  # NUL: 422, not 500
+    assert client.get("/api/v1/agents/Macro (FRED)/log", headers=AUTH).status_code == 200
+    assert client.get(f"/api/v1/agents/{agent}/log?limit=0", headers=AUTH).status_code == 422
+
+
+def test_activity_filters_and_searches(obs_db, seed):
+    t0 = datetime(2001, 7, 1, tzinfo=timezone.utc)
+    alpha = _log(seed, t0, "Validator", "ERROR", f"{O2B} act alpha 100% done")
+    beta = _log(seed, t0 + timedelta(minutes=1), "News", "INFO", f"{O2B} act beta")
+    gamma = _log(seed, t0 + timedelta(minutes=2), "News", "WARNING", f"{O2B} act gamma_x")
+    gamma_z = _log(seed, t0 + timedelta(minutes=3), "News", "INFO", f"{O2B} act gammaZx")
+    delta = _log(seed, t0 + timedelta(minutes=4), "Calendar", "CRITICAL", f"{O2B} act delta")
+    now = datetime.now(timezone.utc)
+
+    def ids(**kw):
+        return [r["id"] for r in queries.activity(obs_db, now, q=f"{O2B} act", **kw)["rows"]]
+
+    assert ids() == [delta, gamma_z, gamma, beta, alpha]  # newest first
+    assert ids(agent="News") == [gamma_z, gamma, beta]
+    assert ids(level="WARNING") == [delta, gamma, alpha]  # a floor: WARNING and above
+    assert ids(level="CRITICAL") == [delta]
+    assert ids(since=t0 + timedelta(minutes=2)) == [delta, gamma_z, gamma]
+    assert ids(limit=2) == [delta, gamma_z]
+    page = queries.activity(obs_db, now, q=f"{O2B} act", limit=2)
+    assert page["next_before_id"] == gamma_z
+    assert ids(before_id=gamma_z) == [gamma, beta, alpha]
+
+    def search(text):
+        return [r["id"] for r in queries.activity(obs_db, now, q=text)["rows"] if r["message"].startswith(O2B)]
+
+    assert search("100% done") == [alpha]          # % is literal
+    assert search(f"{O2B} act gamma_x") == [gamma]  # _ is literal: gammaZx does not match
+    assert search("tst_o2b ACT ALPHA") == [alpha]  # case-insensitive
+
+    future = _log(seed, now + timedelta(days=1), "News", "INFO", f"{O2B} act from the future")
+    assert future not in ids()  # never after `now` (F-38)
+
+    client = TestClient(build_app(SETTINGS, db=obs_db, projector=Projector(obs_db), start_projector=False))
+    response = client.get("/api/v1/activity", params={"q": f"{O2B} act", "level": "ERROR"}, headers=AUTH)
+    assert response.status_code == 200
+    assert [r["id"] for r in response.json()["rows"]] == [delta, alpha]
+    assert client.get("/api/v1/activity?level=LOUD", headers=AUTH).status_code == 422
+    assert client.get("/api/v1/activity?limit=501", headers=AUTH).status_code == 422
+    assert client.get("/api/v1/activity?q=a%00b", headers=AUTH).status_code == 422
+    assert client.get("/api/v1/activity?agent=a%00b", headers=AUTH).status_code == 422
+    since = client.get("/api/v1/activity", params={"q": f"{O2B} act", "since": "2001-07-01T00:03:00"}, headers=AUTH)
+    assert [r["id"] for r in since.json()["rows"]] == [delta, gamma_z]  # a naive time is read as UTC
+
+
+def test_agents_endpoint_lists_every_known_agent(obs_db):
+    client = TestClient(build_app(SETTINGS, db=obs_db, projector=Projector(obs_db), start_projector=False))
+    body = client.get("/api/v1/agents", headers=AUTH).json()
+    assert set(queries.KNOWN_AGENTS) <= {a["agent"] for a in body["agents"]}
+    assert set(body["status_rules"]) == {"active", "quiet", "failing", "never seen"}
+
+
+def test_every_protected_route_needs_the_token_and_rejects_writes():
+    app = _offline_app()
+    client = TestClient(app)
+    paths = sorted(
+        route.path.replace("{signal_id}", "1").replace("{agent}", "Kernel")
+        for router in app.state.api_routers
+        for route in router.routes
+    )
+    assert {"/api/v1/agents", "/api/v1/agents/Kernel/log", "/api/v1/activity"} <= set(paths)
+    assert len(paths) == 10
+    for path in paths:
+        assert client.get(path).status_code == 401, path
+        assert client.get(path, headers={"Authorization": "Bearer wrong-" + "q" * 30}).status_code == 401, path
+        for method in ("POST", "PUT", "DELETE", "PATCH"):
+            assert client.request(method, path, headers=AUTH).status_code == 405, (method, path)
+
+
+def test_agent_log_rows_become_feed_events(obs_db, seed):
+    projector = Projector(obs_db, backfill_per_table=0)
+    projector.prime()
+    start = projector.last_event_id()
+    t0 = datetime(2001, 8, 1, tzinfo=timezone.utc)
+    news = _log(seed, t0, "News", "INFO", f"{O2B} fetched 12 articles", logger_name="sensors.news", thread="nexus-news")
+    _log(seed, t0, "Supervisor", "INFO", f"heartbeat: alive=10 registered=6 dead=0 (of 16 agents) {O2B}", logger_name="backend")
+    kernel = _log(seed, t0, "Kernel", "ERROR", f"{O2B} DENY: kill file present", logger_name="risk.kernel")
+    other = _log(seed, t0, "Other", "WARNING", f"{O2B} yfinance: no data", logger_name="yfinance")
+    hb_warning = _log(seed, t0, "Supervisor", "WARNING", f"heartbeat: build_status_text failed {O2B}", logger_name="backend")
+
+    assert projector.poll_once() == 4  # the routine INFO heartbeat line is not an event; the WARNING one is
+    assert projector.log_lines_absorbed == 1
+    events = projector.events(since_id=start)
+    assert [e["payload"]["row_id"] for e in events] == [news, kernel, other, hb_warning]
+    first, deny, noise, warning = events
+    assert (warning["agent"], warning["ring"], warning["severity"]) == ("Supervisor", 0, "warn")
+    assert (first["agent"], first["ring"], first["severity"], first["event_type"]) == ("News", 3, "info", "log_info")
+    assert first["summary"] == f"{O2B} fetched 12 articles"
+    assert first["payload"] == {"table": "agent_log", "row_id": news, "logger": "sensors.news", "level": "INFO", "thread": "nexus-news"}
+    assert (deny["agent"], deny["ring"], deny["severity"]) == ("Kernel", 0, "error")
+    assert (noise["agent"], noise["ring"], noise["severity"]) == ("Other", 3, "warn")
+    assert projector.watermarks["agent_log"] == hb_warning
+
+
+def test_agent_log_queries_are_bounded_selects(obs_db):
+    db = RecordingDB(obs_db)
+    now = datetime.now(timezone.utc)
+    queries.agents(db, now)
+    queries.agent_log(db, now, "Kernel", 10)
+    queries.agent_log(db, now, "Kernel", 10, before_id=5)
+    queries.agent_log(db, now, f"{O2B} nobody", 10)  # exercises the existence check
+    queries.activity(db, now, agent="News", level="WARNING", q="x", since=now - timedelta(hours=1), before_id=9, limit=5)
+    assert db.statements
+    for sql in db.statements:
+        assert sql.lstrip().upper().startswith("SELECT"), sql
+        assert re.search(r"\bLIMIT\b", sql), sql
+
+
+def test_a_database_without_agent_log_reports_it_missing():
+    class NoAgentLog:
+        def table_exists(self, table):
+            return False
+
+    now = datetime.now(timezone.utc)
+    report = queries.agents(NoAgentLog(), now)
+    assert {a["status"] for a in report["agents"]} == {"never seen"}
+    assert "migration 018" in report["missing"]
+    assert queries.activity(NoAgentLog(), now)["rows"] is None
+    assert queries.agent_log(NoAgentLog(), now, "Kernel", 10)["rows"] is None
+    assert queries.agent_log(NoAgentLog(), now, "Nobody", 10) is None
+
+
+def test_supervisor_heartbeat_events_share_the_supervisor_ring():
+    # Review finding: heartbeat events (ops_heartbeats) and supervisor log lines
+    # (agent_log) must sit in one ring; the brief puts the supervisor in ring 0.
+    projector = Projector(ReadOnlyDB("dbname=never_opened"))
+    row = {"id": 1, "ts": "2026-10-30T12:00:00+00:00", "stage": "PAPER", "alive": 10, "registered": 6,
+           "dead": 0, "doctrine_bias": "FLAT", "doctrine_source": "FABLE", "sensors": {}}
+    assert projector._normalize("ops_heartbeats", row)["ring"] == queries.AGENT_RING["Supervisor"] == 0

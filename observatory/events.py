@@ -12,7 +12,8 @@ sequence number (it restarts with the process; `epoch` in health tells a client
 to resync). The source table and row id are in `payload`.
 
 Rings: sensors 3 · doctrine/analysis/validator 2 · paper engine/router/
-positions/fills 1 · kernel/stage/commands 0.
+positions/fills 1 · kernel/stage/commands/supervisor 0. agent_log rows take
+the ring of their agent (queries.AGENTS).
 
 Signals are updated in place and have no per-change log, so their status
 changes are found by re-reading the recently active signals and diffing the
@@ -33,6 +34,7 @@ import psycopg2
 import psycopg2.errors
 
 from .db import ReadOnlyDB
+from .queries import AGENT_RING
 
 logger = logging.getLogger("observatory.events")
 
@@ -74,8 +76,18 @@ TABLES = [
         "id, ts, stage, alive, registered, dead, rss_mb, model_ok_at, doctrine_bias, "
         "doctrine_source, sensors",
     ),
+    # Task O2b: every agent's own log lines (INFO+), copied by the backend.
+    ("agent_log", "id, ts, agent, logger, level, message, thread"),
 ]
 TABLE_NAMES = [name for name, _ in TABLES]
+
+# Python logging level -> event severity.
+LEVEL_SEVERITY = {"DEBUG": "debug", "INFO": "info", "WARNING": "warn", "ERROR": "error", "CRITICAL": "critical"}
+
+# The backend no longer stores the supervisor's routine "heartbeat: ..." INFO
+# line (ops_heartbeats carries that state). Should one arrive anyway (older
+# data), it is still not an event; a heartbeat line at WARNING+ always is.
+_SUPERVISOR_HEARTBEAT_PREFIX = "heartbeat:"
 
 # Heartbeats arrive every 30 s. Only a change in these fields is an event;
 # otherwise 2,880 identical rows a day would flush everything else out of the
@@ -147,6 +159,7 @@ class Projector:
         self.active_signals: Dict[int, str] = {}
         self._last_heartbeat_key: Optional[tuple] = None
         self.heartbeats_absorbed = 0
+        self.log_lines_absorbed = 0
 
         self.primed = False
         self.state = "starting"
@@ -502,7 +515,7 @@ class Projector:
         self._last_heartbeat_key = key
         dead = row.get("dead") or 0
         return {
-            "ring": 3,
+            "ring": 0,
             "agent": "supervisor",
             "event_type": "heartbeat",
             "severity": "error" if dead else "debug",
@@ -517,6 +530,24 @@ class Projector:
                 "stage", "alive", "registered", "dead", "rss_mb", "model_ok_at",
                 "doctrine_bias", "doctrine_source", "sensors",
             )},
+        }
+
+    def _n_agent_log(self, row):
+        agent = row.get("agent") or "Other"
+        message = row.get("message") or ""
+        level = (row.get("level") or "INFO").upper()
+        if agent == "Supervisor" and level == "INFO" and message.startswith(_SUPERVISOR_HEARTBEAT_PREFIX):
+            self.log_lines_absorbed += 1
+            return None
+        return {
+            "ring": AGENT_RING.get(agent, AGENT_RING["Other"]),
+            "agent": agent,
+            "event_type": f"log_{level.lower()}",
+            "severity": LEVEL_SEVERITY.get(level, "info"),
+            "correlation_id": None,
+            "trade_id": None,
+            "summary": message,
+            "payload": {"logger": row.get("logger"), "level": level, "thread": row.get("thread")},
         }
 
     # -- buffer -----------------------------------------------------------------
@@ -595,6 +626,7 @@ class Projector:
             "absent_tables": sorted(self.absent_tables) or None,
             "last_error": self.last_error,
             "heartbeats_absorbed": self.heartbeats_absorbed,
+            "log_lines_absorbed": self.log_lines_absorbed,
         }
 
 

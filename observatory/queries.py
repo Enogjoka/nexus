@@ -497,3 +497,223 @@ def heartbeats(db: ReadOnlyDB, now: datetime, minutes: int) -> Dict[str, Any]:
         (since, now),
     )
     return {"minutes": minutes, "since": since.isoformat(), "count": len(rows), "rows": rows, "missing": None}
+
+
+# ==========================================================================
+# agents and their action log (Task O2b)
+# ==========================================================================
+
+# Every agent name the trading process writes into agent_log, with its ring.
+# It mirrors backend.AGENT_LOGGER_MAP, which the observatory must not import;
+# tests/test_observatory.py checks that the two lists match.
+AGENTS: List[Tuple[str, int]] = [
+    ("Price feed", 3),
+    ("Macro (FRED)", 3),
+    ("Positioning (COT)", 3),
+    ("Calendar", 3),
+    ("News", 3),
+    ("Basis", 3),
+    ("State vector", 3),
+    ("Analyst", 2),
+    ("Doctrine", 2),
+    ("Validator", 2),
+    ("Regime model", 2),
+    ("Memory", 2),
+    ("Learning loop", 2),
+    ("Paper engine", 1),
+    ("Router", 1),
+    ("Position engine", 1),
+    ("Pods", 1),
+    ("Link", 1),
+    ("Kernel", 0),
+    ("Stage", 0),
+    ("Supervisor", 0),
+    ("Telegram", 0),
+    ("Other", 3),
+]
+AGENT_RING: Dict[str, int] = dict(AGENTS)
+KNOWN_AGENTS: List[str] = [name for name, _ in AGENTS]
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+FAILING_LEVELS = ("ERROR", "CRITICAL")
+ACTIVE_WINDOW = timedelta(hours=1)
+DAY_WINDOW = timedelta(hours=24)
+AGENT_LOG_MISSING = "agent_log table not present (migration 018 not applied on this database)"
+STATUS_RULES = {
+    "failing": "an ERROR or CRITICAL record in the last hour",
+    "active": "acted in the last hour, without errors",
+    "quiet": "seen before, but nothing in the last hour",
+    "never seen": "no record at all (within the 7-day retention)",
+}
+_LAST_MESSAGE_CHARS = 300
+
+
+def agent_status(last_ts: Optional[datetime], counts_1h: Dict[str, int]) -> str:
+    """The plain status of one agent; see STATUS_RULES."""
+    if last_ts is None:
+        return "never seen"
+    if any(counts_1h.get(level, 0) for level in FAILING_LEVELS):
+        return "failing"
+    if sum(counts_1h.values()) > 0:
+        return "active"
+    return "quiet"
+
+
+def agents(db: ReadOnlyDB, now: datetime) -> Dict[str, Any]:
+    """Every known agent, silent ones included, with its last action and counts."""
+    if not db.table_exists("agent_log"):
+        return {
+            "as_of": now.isoformat(),
+            "agents": [
+                {"agent": name, "ring": ring, "status": "never seen", "last_ts": None, "last_level": None,
+                 "last_message": None, "counts_1h": {}, "counts_24h": {}, "n_1h": 0, "n_24h": 0}
+                for name, ring in AGENTS
+            ],
+            "status_rules": STATUS_RULES,
+            "missing": AGENT_LOG_MISSING,
+        }
+
+    counted = db.rows(
+        "SELECT agent, level, count(1) FILTER (WHERE ts > %s) AS n_1h, count(1) AS n_24h "
+        "FROM agent_log WHERE ts > %s AND ts <= %s GROUP BY agent, level LIMIT 2000",
+        (now - ACTIVE_WINDOW, now - DAY_WINDOW, now),
+    )
+    names = list(KNOWN_AGENTS)
+    for row in counted:  # an agent the backend names that this list does not know yet
+        if row["agent"] not in AGENT_RING and row["agent"] not in names:
+            names.append(row["agent"])
+
+    # One index lookup per agent (agent, ts DESC) instead of scanning the table.
+    last = {
+        row["agent"]: row
+        for row in db.rows(
+            "SELECT a.agent, l.ts, l.level, left(l.message, %s) AS message "
+            "FROM unnest(%s::text[]) AS a(agent) "
+            "LEFT JOIN LATERAL (SELECT ts, level, message FROM agent_log "
+            "  WHERE agent = a.agent AND ts <= %s ORDER BY ts DESC, id DESC LIMIT 1) AS l ON true "
+            "LIMIT 200",
+            (_LAST_MESSAGE_CHARS, names, now),
+        )
+    }
+
+    out = []
+    for name in names:
+        counts_1h = {r["level"]: r["n_1h"] for r in counted if r["agent"] == name and r["n_1h"]}
+        counts_24h = {r["level"]: r["n_24h"] for r in counted if r["agent"] == name}
+        row = last.get(name) or {}
+        last_ts = _parse_ts(row.get("ts"))
+        out.append({
+            "agent": name,
+            "ring": AGENT_RING.get(name, AGENT_RING["Other"]),
+            "status": agent_status(last_ts, counts_1h),
+            "last_ts": row.get("ts"),
+            "last_level": row.get("level"),
+            "last_message": row.get("message"),
+            "counts_1h": counts_1h,
+            "counts_24h": counts_24h,
+            "n_1h": sum(counts_1h.values()),
+            "n_24h": sum(counts_24h.values()),
+        })
+    return {"as_of": now.isoformat(), "agents": out, "status_rules": STATUS_RULES, "missing": None}
+
+
+_LOG_COLUMNS = "id, ts, agent, logger, level, message, thread"
+
+
+def agent_log(
+    db: ReadOnlyDB, now: datetime, agent: str, limit: int, before_id: Optional[int] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    One agent's history, newest first, paged by id: pass the previous page's
+    next_before_id as before_id. Never returns rows stamped after `now`. None
+    for an agent name that is neither known nor present in the table,
+    whatever the paging.
+    """
+    if not db.table_exists("agent_log"):
+        if agent not in AGENT_RING:
+            return None
+        return {"agent": agent, "rows": None, "next_before_id": None, "missing": AGENT_LOG_MISSING}
+    clauses = ["agent = %s", "ts <= %s"]
+    params: List[Any] = [agent, now]
+    if before_id is not None:
+        clauses.append("id < %s")
+        params.append(before_id)
+    rows = db.rows(
+        f"SELECT {_LOG_COLUMNS} FROM agent_log WHERE " + " AND ".join(clauses) + " ORDER BY id DESC LIMIT %s",
+        (*params, limit),
+    )
+    if not rows and agent not in AGENT_RING:
+        seen = db.one("SELECT 1 AS seen FROM agent_log WHERE agent = %s AND ts <= %s LIMIT 1", (agent, now))
+        if seen is None:
+            return None
+    return {
+        "agent": agent,
+        "ring": AGENT_RING.get(agent, AGENT_RING["Other"]),
+        "limit": limit,
+        "before_id": before_id,
+        "count": len(rows),
+        "rows": rows,
+        "next_before_id": rows[-1]["id"] if len(rows) == limit else None,
+        "missing": None,
+    }
+
+
+def _like_pattern(text: str) -> str:
+    """A literal substring for ILIKE: % and _ in the search text match themselves."""
+    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def activity(
+    db: ReadOnlyDB,
+    now: datetime,
+    agent: Optional[str] = None,
+    level: Optional[str] = None,
+    q: Optional[str] = None,
+    since: Optional[datetime] = None,
+    before_id: Optional[int] = None,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """
+    Every agent's actions, newest first. `level` is a floor (WARNING returns
+    WARNING, ERROR and CRITICAL); `q` is a case-insensitive substring of the
+    message. Never returns rows stamped after `now`.
+    """
+    filters = {
+        "agent": agent,
+        "level": level,
+        "q": q,
+        "since": since.isoformat() if since else None,
+        "before_id": before_id,
+        "limit": limit,
+    }
+    if not db.table_exists("agent_log"):
+        return {"filters": filters, "count": 0, "rows": None, "next_before_id": None, "missing": AGENT_LOG_MISSING}
+
+    clauses = ["ts <= %s"]
+    params: List[Any] = [now]
+    if agent:
+        clauses.append("agent = %s")
+        params.append(agent)
+    if level:
+        clauses.append("level = ANY(%s)")
+        params.append(list(LOG_LEVELS[LOG_LEVELS.index(level):]))
+    if q:
+        clauses.append("message ILIKE %s ESCAPE '\\'")
+        params.append(_like_pattern(q))
+    if since is not None:
+        clauses.append("ts >= %s")
+        params.append(since)
+    if before_id is not None:
+        clauses.append("id < %s")
+        params.append(before_id)
+    rows = db.rows(
+        f"SELECT {_LOG_COLUMNS} FROM agent_log WHERE " + " AND ".join(clauses) + " ORDER BY id DESC LIMIT %s",
+        (*params, limit),
+    )
+    return {
+        "filters": filters,
+        "count": len(rows),
+        "rows": rows,
+        "next_before_id": rows[-1]["id"] if len(rows) == limit else None,
+        "missing": None,
+    }

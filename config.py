@@ -262,6 +262,14 @@ HEARTBEAT_TELEGRAM_HOURS = 12  # /status-style summary cadence; 0 disables
 HEARTBEAT_RETENTION_DAYS = 14      # ops_heartbeats rows older than this are pruned once a day
 HEARTBEAT_STATEMENT_TIMEOUT_MS = 5000  # per-statement cap inside the heartbeat transaction
 MODEL_SILENCE_ALERT_MINUTES = 120  # no successful AI call for this long -> Telegram alert (and its repeat interval)
+# Task O2b: backend.py copies every INFO+ log record into agent_log.
+AGENT_LOG_QUEUE_MAX = 5000           # bounded hand-off queue; when full, records are dropped and counted
+AGENT_LOG_BATCH_MAX = 500            # rows per insert
+AGENT_LOG_FLUSH_SECONDS = 1.0        # the writer thread inserts one batch per tick
+AGENT_LOG_MESSAGE_MAX = 2000         # characters kept per message, after redaction
+AGENT_LOG_CONNECT_TIMEOUT_S = 5      # the writer's own connection (F-40)
+AGENT_LOG_STATEMENT_TIMEOUT_MS = 5000
+AGENT_LOG_RETENTION_DAYS = 7         # pruned once a day, beside the heartbeat pruning
 
 # STAGE GOVERNOR (risk/stage.py) — the ladder as enforceable machinery.
 # The Stage enum and get_stage() at the top of this file are the mechanism;

@@ -33,13 +33,21 @@ load_dotenv()
 
 import json
 import logging
+import os
+import queue
+import re
 import signal
 import sys
 import threading
 import time
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable, Deque, Dict, Iterable, List, NamedTuple, Optional
+from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, NamedTuple, Optional, Tuple
+from urllib.parse import unquote, urlsplit
+
+import psycopg2
+import psycopg2.extensions
+import psycopg2.extras
 
 import config
 from config import get_stage
@@ -208,6 +216,359 @@ def prune_heartbeats(cur, now: datetime) -> None:
     cutoff = now - timedelta(days=config.HEARTBEAT_RETENTION_DAYS)
     cur.execute("DELETE FROM ops_heartbeats WHERE ts < %s", (cutoff,))
     logger.info("ops heartbeat: pruned %d rows older than %s", cur.rowcount, cutoff.isoformat())
+
+
+def prune_agent_log(cur, now: datetime) -> None:
+    """Delete agent_log rows older than config.AGENT_LOG_RETENTION_DAYS."""
+    cutoff = now - timedelta(days=config.AGENT_LOG_RETENTION_DAYS)
+    cur.execute("DELETE FROM agent_log WHERE ts < %s", (cutoff,))
+    logger.info("agent log: pruned %d rows older than %s", cur.rowcount, cutoff.isoformat())
+
+
+# --------------------------------------------------------------------------
+# Agent action log (Task O2b). Every agent already narrates what it does
+# through `logging`; AgentLogHandler copies each INFO+ record into agent_log
+# so the Observatory can show it. No agent module changes, and no agent ever
+# waits: emit() only redacts and enqueues; one writer thread does all I/O.
+# --------------------------------------------------------------------------
+
+# Logger-name prefix -> agent display name. A prefix matches the logger itself
+# and its children ("pods" covers "pods.s1_fixfade"); the longest match wins.
+# Anything unmatched is AGENT_OTHER.
+AGENT_LOGGER_MAP: Dict[str, str] = {
+    "data.gold_agent": "Price feed",
+    "data.mt5_bridge": "Router",  # the execution bridge the router sends through
+    "sensors.fred": "Macro (FRED)",
+    "sensors.positioning": "Positioning (COT)",
+    "sensors.calendar_agent": "Calendar",
+    "sensors.news": "News",
+    "sensors.basis": "Basis",
+    "fusion.state_vector": "State vector",
+    "fusion.regime": "Regime model",
+    "fusion.rag": "Memory",
+    "fusion.learning_loop": "Learning loop",
+    "ai.analysis": "Analyst",
+    "ai.price_resolver": "Analyst",  # runs inside the analyst's cycle
+    "ai.doctrine": "Doctrine",
+    "risk.validator": "Validator",
+    "risk.sizing": "Analyst",  # runs inside the analyst's cycle
+    "risk.kernel": "Kernel",
+    "risk.stage": "Stage",
+    "exec_.paper_engine": "Paper engine",
+    "exec_.router": "Router",
+    "exec_.position_engine": "Position engine",
+    "exec_.pod_agent": "Pods",
+    "pods": "Pods",
+    "ops.telegram_bot": "Telegram",
+    "backend": "Supervisor",
+    "link": "Link",
+}
+AGENT_OTHER = "Other"
+
+# Never copied: the database driver (the writer's own traffic would loop back)
+# and HTTP / async plumbing, which narrates transport rather than agent
+# actions. httpx2 is the logger the Anthropic SDK uses for each request.
+AGENT_LOG_IGNORED_LOGGERS = ("psycopg2", "urllib3", "httpx", "httpx2", "httpcore", "asyncio")
+
+# The supervisor's routine "heartbeat: alive=..." INFO line, every poll, duplicates
+# ops_heartbeats (and would be most of the table). It is not copied. Any
+# heartbeat line at WARNING or above is, as is every other supervisor record.
+SUPERVISOR_ROUTINE_PREFIX = "heartbeat:"
+
+# Environment values that must never reach the table (plus the password in
+# DATABASE_URL). Each is replaced by "*" wherever it appears.
+AGENT_LOG_SECRET_NAMES = ("ANTHROPIC_API_KEY", "FRED_API_KEY", "TELEGRAM_BOT_TOKEN", "HMAC_SECRET")
+
+_API_KEY_PARAM = re.compile(r"(?i)(\bapi_?key=)[^&\s'\"#]+")
+_BOT_SEGMENT = re.compile(r"(/bot)\d+:[A-Za-z0-9_-]+")
+_URL_PASSWORD = re.compile(r"(://[^/\s:@]+:)[^@\s/]+(@)")
+# Characters dropped from the end of a pre-cut message (see _render): at least
+# the longest secret, and enough for any api_key= or bot-token fragment.
+_REDACTION_MARGIN = 64
+
+
+def _prefix_match(name: str, prefix: str) -> bool:
+    return name == prefix or name.startswith(prefix + ".")
+
+
+def agent_for_logger(name: str) -> str:
+    """The agent a logger belongs to, by the longest matching prefix."""
+    best: Optional[str] = None
+    for prefix in AGENT_LOGGER_MAP:
+        if _prefix_match(name, prefix) and (best is None or len(prefix) > len(best)):
+            best = prefix
+    return AGENT_LOGGER_MAP[best] if best is not None else AGENT_OTHER
+
+
+def _database_passwords(url: Optional[str]) -> List[str]:
+    """The password in a DSN or URL, decoded and as written (URLs may encode it)."""
+    found: List[str] = []
+    if not url:
+        return found
+    try:
+        password = psycopg2.extensions.parse_dsn(url).get("password")
+        if password:
+            found.append(password)
+    except Exception:
+        pass
+    try:
+        raw = urlsplit(url).password
+        if raw:
+            found.extend({raw, unquote(raw)})
+    except Exception:
+        pass
+    return found
+
+
+def collect_secrets(env: Optional[Mapping[str, str]] = None) -> List[str]:
+    """Every non-empty secret value, longest first, from `env` and config."""
+    env = os.environ if env is None else env
+    values = set()
+    for name in AGENT_LOG_SECRET_NAMES:
+        for value in (env.get(name), getattr(config, name, None)):
+            if value:
+                values.add(str(value))
+    for url in (env.get("DATABASE_URL"), config.DATABASE_URL):
+        values.update(_database_passwords(url))
+    return sorted(values, key=len, reverse=True)
+
+
+def _stderr(text: str) -> None:
+    """Report the log pipeline's own trouble without going through logging."""
+    try:
+        sys.stderr.write(f"agent_log: {text}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+class AgentLogHandler(logging.Handler):
+    """
+    Copies INFO+ records into agent_log without ever slowing the caller.
+
+    emit() redacts, caps and enqueues (bounded; when full the record is
+    dropped and counted) and never raises. One writer thread, started with
+    start_writer(), inserts at most one batch per tick on its own connection
+    with a connect timeout and a statement timeout. A failed batch is dropped,
+    reported on stderr, and the writer carries on.
+    """
+
+    def __init__(
+        self,
+        database_url: Optional[str] = None,
+        env: Optional[Mapping[str, str]] = None,
+        queue_max: Optional[int] = None,
+        batch_max: Optional[int] = None,
+        flush_seconds: Optional[float] = None,
+    ) -> None:
+        super().__init__(level=logging.INFO)
+        self.database_url = config.DATABASE_URL if database_url is None else database_url
+        self.secrets = collect_secrets(env)
+        self.secret_max = max((len(s) for s in self.secrets), default=0)
+        # SimpleQueue, not Queue: its put() is reentrant, so a record logged from
+        # a signal handler (request_stop) that interrupts another put() on the
+        # same thread cannot deadlock. The bound is enforced here, approximately.
+        self.queue: "queue.SimpleQueue[Tuple[Any, ...]]" = queue.SimpleQueue()
+        self.queue_max = config.AGENT_LOG_QUEUE_MAX if queue_max is None else queue_max
+        self.batch_max = config.AGENT_LOG_BATCH_MAX if batch_max is None else batch_max
+        self.flush_seconds = config.AGENT_LOG_FLUSH_SECONDS if flush_seconds is None else flush_seconds
+        self.message_max = config.AGENT_LOG_MESSAGE_MAX
+
+        self.dropped = 0          # queue full (counted under the handler lock)
+        self.emit_errors = 0      # a record that could not even be rendered
+        self.routine_skipped = 0  # supervisor heartbeat lines (see SUPERVISOR_ROUTINE_PREFIX)
+        self.written = 0          # writer thread only
+        self.failed_batches = 0   # writer thread only
+        self.lost_in_failures = 0
+
+        self._reported = (0, 0)
+        self._writer: Optional[threading.Thread] = None
+        self._writer_ident: Optional[int] = None
+        self._stop = threading.Event()
+        self._conn = None
+
+    # -- the hot path (runs on the agent's own thread) ------------------------
+
+    def redact(self, text: str) -> str:
+        for secret in self.secrets:
+            text = text.replace(secret, "*")
+        text = _API_KEY_PARAM.sub(r"\1*", text)
+        text = _BOT_SEGMENT.sub(r"\1*", text)
+        return _URL_PASSWORD.sub(r"\1*\2", text)
+
+    def _render(self, record: logging.LogRecord) -> str:
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(record.msg)
+        if record.exc_info and record.exc_info[1] is not None:
+            exc = record.exc_info[1]
+            try:
+                detail = str(exc)
+            except Exception:
+                detail = "<unprintable>"
+            # Type and message only: a traceback can carry locals and paths.
+            message = f"{message} | {type(exc).__name__}: {detail}"
+        # Postgres text cannot hold NUL; one such record would sink its batch.
+        message = message.replace("\x00", "\\0")
+        # Bound the redaction work on huge messages. A secret (or api_key= /
+        # bot-token value) cut by this pre-cut is a fragment the redaction
+        # cannot recognise, and earlier redactions shorten the text and would
+        # pull that fragment into the kept part, so when the pre-cut bit, the
+        # last `margin` characters after redaction are discarded.
+        margin = max(self.secret_max, _REDACTION_MARGIN)
+        cut = message[: self.message_max + margin]
+        redacted = self.redact(cut)
+        if len(cut) < len(message):
+            redacted = redacted[: max(0, len(redacted) - margin)]
+        return redacted[: self.message_max]
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if record.levelno < self.level:  # the logger checks this too; handle() alone does not
+                return
+            if self._writer_ident is not None and record.thread == self._writer_ident:
+                return
+            if any(_prefix_match(record.name, p) for p in AGENT_LOG_IGNORED_LOGGERS):
+                return
+            agent = agent_for_logger(record.name)
+            if (
+                agent == "Supervisor"
+                and record.levelno < logging.WARNING
+                and isinstance(record.msg, str)
+                and record.msg.startswith(SUPERVISOR_ROUTINE_PREFIX)
+            ):
+                self.routine_skipped += 1
+                return
+            row = (
+                datetime.fromtimestamp(record.created, tz=timezone.utc),
+                agent,
+                record.name,
+                record.levelname,
+                self._render(record),
+                record.threadName,
+            )
+            if self.queue.qsize() >= self.queue_max:
+                self.dropped += 1
+            else:
+                self.queue.put_nowait(row)
+        except Exception:
+            self.emit_errors += 1  # never raise into the agent that logged
+
+    # -- the writer (its own thread, its own connection) -----------------------
+
+    def _connection(self):
+        if self._conn is None or self._conn.closed:
+            self._conn = psycopg2.connect(
+                self.database_url,
+                connect_timeout=config.AGENT_LOG_CONNECT_TIMEOUT_S,
+                options=f"-c statement_timeout={int(config.AGENT_LOG_STATEMENT_TIMEOUT_MS)}",
+                application_name="nexus-agent-log",
+                # statement_timeout is enforced by the server; a dead peer is
+                # caught on this side by TCP keepalives and the user timeout.
+                keepalives=1,
+                keepalives_idle=10,
+                keepalives_interval=5,
+                keepalives_count=3,
+                tcp_user_timeout=int(config.AGENT_LOG_STATEMENT_TIMEOUT_MS) + 5000,
+            )
+        return self._conn
+
+    def _drop_connection(self) -> None:
+        try:
+            if self._conn is not None:
+                self._conn.close()
+        except Exception:
+            pass
+        self._conn = None
+
+    def flush_once(self) -> int:
+        """Insert up to batch_max queued rows. Returns rows written; never raises."""
+        batch = []
+        while len(batch) < self.batch_max:
+            try:
+                batch.append(self.queue.get_nowait())
+            except queue.Empty:
+                break
+        if not batch:
+            return 0
+        try:
+            conn = self._connection()
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur,
+                    "INSERT INTO agent_log (ts, agent, logger, level, message, thread) VALUES %s",
+                    batch,
+                    page_size=self.batch_max,
+                )
+            conn.commit()
+        except Exception as exc:
+            self.failed_batches += 1
+            self.lost_in_failures += len(batch)
+            self._drop_connection()
+            _stderr(f"dropped a batch of {len(batch)} rows: {type(exc).__name__}: {self.redact(str(exc))[:300]}")
+            return 0
+        self.written += len(batch)
+        return len(batch)
+
+    def _report_drops(self) -> None:
+        """One stderr line per tick in which records were dropped before queueing."""
+        lost = (self.dropped, self.emit_errors)
+        if lost != self._reported:
+            _stderr(f"queue full or unrenderable: {self.dropped} dropped, {self.emit_errors} render errors so far")
+            self._reported = lost
+
+    def _run_writer(self) -> None:
+        self._writer_ident = threading.get_ident()
+        while not self._stop.is_set():
+            try:
+                self.flush_once()
+                self._report_drops()
+            except Exception as exc:  # flush_once already guards; belt and braces
+                _stderr(f"writer error: {type(exc).__name__}")
+            self._stop.wait(self.flush_seconds)
+        # Final drain, bounded: at most one queue's worth.
+        for _ in range(self.queue_max // max(1, self.batch_max) + 1):
+            if not self.flush_once():
+                break
+        self._drop_connection()
+
+    def start_writer(self) -> None:
+        if self._writer is not None:
+            return
+        self._writer = threading.Thread(target=self._run_writer, name="nexus-agent-log", daemon=True)
+        self._writer.start()
+
+    def stats(self) -> Dict[str, int]:
+        return {
+            "queued": self.queue.qsize(),
+            "dropped": self.dropped,
+            "emit_errors": self.emit_errors,
+            "routine_skipped": self.routine_skipped,
+            "written": self.written,
+            "failed_batches": self.failed_batches,
+            "lost_in_failures": self.lost_in_failures,
+        }
+
+    def close(self) -> None:
+        self._stop.set()
+        writer = self._writer
+        if writer is not None and writer.is_alive() and writer.ident != threading.get_ident():
+            writer.join(timeout=config.AGENT_LOG_CONNECT_TIMEOUT_S + 5)
+        super().close()
+
+
+def attach_agent_log() -> AgentLogHandler:
+    """Attach the agent-log handler to the root logger. Called by main() only."""
+    handler = AgentLogHandler()
+    logging.getLogger().addHandler(handler)
+    return handler
+
+
+def detach_agent_log(handler: AgentLogHandler) -> None:
+    """Remove the handler and let its writer flush what is queued."""
+    logging.getLogger().removeHandler(handler)
+    handler.close()
 
 
 def configure_logging() -> None:
@@ -588,6 +949,12 @@ class Supervisor:
                         except Exception:
                             cur.execute("ROLLBACK TO SAVEPOINT hb_prune")
                             logger.error("ops heartbeat: prune failed", exc_info=True)
+                        cur.execute("SAVEPOINT al_prune")
+                        try:
+                            prune_agent_log(cur, now)
+                        except Exception:
+                            cur.execute("ROLLBACK TO SAVEPOINT al_prune")
+                            logger.error("agent log: prune failed", exc_info=True)
         except Exception:
             row_id = None
             logger.error("ops heartbeat: write failed; supervision continues", exc_info=True)
@@ -667,24 +1034,31 @@ class Supervisor:
 
 def main() -> int:
     configure_logging()
-    # INVARIANT 1: read once, log, never write.
-    logger.info("NEXUS starting - stage=%s", get_stage().value)
+    # Records queue from the first line; the writer starts once boot has
+    # proved the database and applied migrations (agent_log exists).
+    agent_log = attach_agent_log()
+    try:
+        # INVARIANT 1: read once, log, never write.
+        logger.info("NEXUS starting - stage=%s", get_stage().value)
 
-    boot_database()
-    # Ring 0 exists before any agent does.
-    build_execution_stack()
+        boot_database()
+        agent_log.start_writer()
+        # Ring 0 exists before any agent does.
+        build_execution_stack()
 
-    supervisor = Supervisor(ops_heartbeat=True)
-    signal.signal(signal.SIGINT, supervisor.request_stop)
-    signal.signal(signal.SIGTERM, supervisor.request_stop)
+        supervisor = Supervisor(ops_heartbeat=True)
+        signal.signal(signal.SIGINT, supervisor.request_stop)
+        signal.signal(signal.SIGTERM, supervisor.request_stop)
 
-    supervisor.start_all()
-    supervisor.run()
+        supervisor.start_all()
+        supervisor.run()
 
-    # Agents hold no unflushed state — every DB write is per-cycle and already
-    # committed — so there is nothing to drain here.
-    logger.info("shutdown complete")
-    return 0
+        # Agents hold no unflushed state — every DB write is per-cycle and already
+        # committed — so there is nothing to drain here.
+        logger.info("shutdown complete")
+        return 0
+    finally:
+        detach_agent_log(agent_log)  # flushes what is still queued
 
 
 if __name__ == "__main__":

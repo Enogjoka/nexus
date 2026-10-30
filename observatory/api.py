@@ -9,6 +9,9 @@ The Observatory API — GET only, bearer-token auth, no write path anywhere.
     GET /api/v1/candles?tf=&days=
     GET /api/v1/perf?window=day|week|all
     GET /api/v1/heartbeats?minutes=
+    GET /api/v1/agents                 every agent, silent ones included (Task O2b)
+    GET /api/v1/agents/{agent}/log?limit=&before_id=
+    GET /api/v1/activity?agent=&level=&q=&since=&before_id=&limit=
     WS  /ws/events                     pushes new events
     GET /  and any other path          the static web app shell (no auth, no data)
 
@@ -40,7 +43,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 import psycopg2
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, WebSocket
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path as PathParam, Query, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.websockets import WebSocketDisconnect
 
@@ -54,6 +57,8 @@ logger = logging.getLogger("observatory.api")
 _ALLOWED_METHODS = ("GET", "HEAD")
 WS_PUSH_INTERVAL_S = 1.0
 WS_BATCH_LIMIT = 200
+# Free-text parameters may not carry NUL: the database driver refuses it (422, not 500).
+_NO_NUL = r"^[^\x00]*$"
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 _RESERVED_PREFIXES = ("/api", "/ws")
@@ -254,6 +259,41 @@ def build_app(
 
     app.include_router(api)
     app.state.api_router = api  # the token-protected routes, for audits and tests
+
+    # Task O2b: the agent action log. Its own router, under the same token
+    # dependency; app.state.api_routers lists every protected router.
+    agents_api = APIRouter(prefix="/api/v1", dependencies=[Depends(require_token)])
+
+    @agents_api.get("/agents")
+    def agents():
+        return queries.agents(db, clock())
+
+    @agents_api.get("/agents/{agent}/log")
+    def agent_log(
+        agent: str = PathParam(..., min_length=1, max_length=64, pattern=_NO_NUL),
+        limit: int = Query(100, ge=1, le=500),
+        before_id: Optional[int] = Query(None, ge=1),
+    ):
+        found = queries.agent_log(db, clock(), agent, limit, before_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail=f"unknown agent {agent!r}")
+        return found
+
+    @agents_api.get("/activity")
+    def activity(
+        agent: Optional[str] = Query(None, min_length=1, max_length=64, pattern=_NO_NUL),
+        level: Optional[Literal[queries.LOG_LEVELS]] = Query(None),
+        q: Optional[str] = Query(None, min_length=1, max_length=200, pattern=_NO_NUL),
+        since: Optional[datetime] = Query(None),
+        before_id: Optional[int] = Query(None, ge=1),
+        limit: int = Query(100, ge=1, le=500),
+    ):
+        if since is not None and since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)  # every time in this API is UTC
+        return queries.activity(db, clock(), agent=agent, level=level, q=q, since=since, before_id=before_id, limit=limit)
+
+    app.include_router(agents_api)
+    app.state.api_routers = [api, agents_api]
 
     @app.websocket("/ws/events")
     async def ws_events(websocket: WebSocket):

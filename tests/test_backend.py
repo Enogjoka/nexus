@@ -784,3 +784,448 @@ def test_readonly_roles_sql_carries_no_password():
         assert f"CREATE ROLE {role}" in sql
     assert "GRANT SELECT ON ALL TABLES IN SCHEMA public TO nexus_readonly" in sql
     assert not re.search(r"GRANT\s+(INSERT|UPDATE|DELETE|ALL)\b", sql, re.IGNORECASE)
+
+
+# ===========================================================================
+# Task O2b — agent action log (AgentLogHandler)
+# ===========================================================================
+# Imports for this section only.
+import queue as queue_module  # noqa: E402
+import sys as sys_module  # noqa: E402
+import time as time_module  # noqa: E402
+
+import psycopg2  # noqa: E402
+
+MARK = "TST_O2B"
+
+
+@pytest.fixture(autouse=True)
+def _no_agent_log_writer_unless_asked(request, monkeypatch):
+    """
+    main() now starts the agent-log writer, which would insert this file's boot
+    log lines into nexus_dev on every run. Here start_writer() is a no-op —
+    records still queue, nothing is written — unless a test asks for the
+    `real_writer` fixture. This only prevents writes; it never permits one.
+    """
+    if "real_writer" not in request.fixturenames:
+        monkeypatch.setattr(backend.AgentLogHandler, "start_writer", lambda self: None)
+
+
+@pytest.fixture
+def real_writer():
+    """Opt in to the genuine writer thread (see the autouse fixture above)."""
+    return True
+
+
+@pytest.fixture
+def agent_log_rows(ops_db):
+    """nexus_dev at the current schema; removes every row this file wrote."""
+    yield
+    database.execute("DELETE FROM agent_log WHERE message LIKE %s", (f"{MARK}%",))
+
+
+def _record(name, msg, level=logging.INFO, args=(), exc_info=None):
+    return logging.LogRecord(name, level, __file__, 1, msg, args, exc_info)
+
+
+def _offline_handler(**kwargs):
+    kwargs.setdefault("database_url", "host=127.0.0.1 port=1 dbname=never_opened connect_timeout=1")
+    kwargs.setdefault("env", {})
+    return backend.AgentLogHandler(**kwargs)
+
+
+def _drain(handler):
+    rows = []
+    while True:
+        try:
+            rows.append(handler.queue.get_nowait())
+        except queue_module.Empty:
+            return rows
+
+
+def test_agent_log_handler_enqueues_without_touching_the_database(monkeypatch):
+    def no_db(*args, **kwargs):
+        raise AssertionError("emit() must never open a connection")
+
+    monkeypatch.setattr(backend.psycopg2, "connect", no_db)
+    handler = _offline_handler()
+    handler.handle(_record("sensors.news", "fetched %d articles", args=(12,)))
+    handler.handle(_record("sensors.news", "debug chatter", level=logging.DEBUG))  # below INFO
+
+    rows = _drain(handler)
+    assert len(rows) == 1
+    ts, agent, logger_name, level, message, thread = rows[0]
+    assert (agent, logger_name, level, message) == ("News", "sensors.news", "INFO", "fetched 12 articles")
+    assert ts.tzinfo is not None and thread == threading.current_thread().name
+
+
+def test_a_full_queue_drops_and_counts_and_never_blocks():
+    handler = _offline_handler(queue_max=3)
+    durations = []
+    for i in range(50):
+        started = time_module.perf_counter()
+        handler.handle(_record("ai.analysis", f"{MARK} cycle {i}"))
+        durations.append(time_module.perf_counter() - started)
+    assert handler.queue.qsize() == 3
+    assert handler.dropped == 47
+    assert max(durations) < 0.01  # emit only redacts and enqueues
+    assert sum(durations) < 0.1
+
+
+def test_a_writer_db_failure_does_not_raise_and_the_next_batch_writes(agent_log_rows, monkeypatch, capsys):
+    handler = backend.AgentLogHandler(database_url=config.DATABASE_URL, env={})
+    real_connection = handler._connection
+    attempts = {"n": 0}
+
+    def flaky():
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise psycopg2.OperationalError("simulated outage")
+        return real_connection()
+
+    monkeypatch.setattr(handler, "_connection", flaky)
+    try:
+        handler.handle(_record("ai.doctrine", f"{MARK} lost with the failed batch"))
+        assert handler.flush_once() == 0  # no raise
+        assert handler.failed_batches == 1 and handler.lost_in_failures == 1
+        assert "dropped a batch of 1 rows: OperationalError" in capsys.readouterr().err
+
+        handler.handle(_record("ai.doctrine", f"{MARK} written by the next batch"))
+        assert handler.flush_once() == 1
+    finally:
+        handler._drop_connection()
+
+    stored = [r[0] for r in database.fetch("SELECT message FROM agent_log WHERE message LIKE %s", (f"{MARK}%",))]
+    assert stored == [f"{MARK} written by the next batch"]
+
+
+FAKE_SECRETS = {
+    "ANTHROPIC_API_KEY": "sk-ant-api03-FAKEanthropic0001",
+    "FRED_API_KEY": "fredFAKEkey0002",
+    "TELEGRAM_BOT_TOKEN": "7000001:AAFAKEtelegramToken0003",
+    "HMAC_SECRET": "hmacFAKEsecret0004",
+    "DATABASE_URL": "postgresql://nexus:dbFAKEpass0005@db.example:5432/nexus",
+}
+
+
+def test_secrets_never_land_in_the_table(agent_log_rows):
+    handler = backend.AgentLogHandler(database_url=config.DATABASE_URL, env=FAKE_SECRETS)
+    lines = [
+        f"{MARK} key {FAKE_SECRETS['ANTHROPIC_API_KEY']} in a message",
+        f"{MARK} fred {FAKE_SECRETS['FRED_API_KEY']} and hmac {FAKE_SECRETS['HMAC_SECRET']}",
+        f"{MARK} bot token {FAKE_SECRETS['TELEGRAM_BOT_TOKEN']}",
+        f"{MARK} dsn {FAKE_SECRETS['DATABASE_URL']}",
+        f"{MARK} GET https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&api_key=fredOTHERkey9&file_type=json",
+        f"{MARK} POST https://api.telegram.org/bot123:ABC/sendMessage",
+    ]
+    for line in lines:
+        handler.handle(_record("sensors.fred", line))
+    try:
+        assert handler.flush_once() == len(lines)
+    finally:
+        handler._drop_connection()
+
+    stored = [r[0] for r in database.fetch(
+        "SELECT message FROM agent_log WHERE message LIKE %s ORDER BY id", (f"{MARK}%",)
+    )]
+    assert len(stored) == len(lines)
+    forbidden = [v for k, v in FAKE_SECRETS.items() if k != "DATABASE_URL"] + [
+        "dbFAKEpass0005", "fredOTHERkey9", "123:ABC",
+    ]
+    for message in stored:
+        for secret in forbidden:
+            assert secret not in message, (secret, message)
+    # Redacted, not deleted: the shape of each line survives.
+    assert "api_key=*&file_type=json" in stored[4]
+    assert "https://api.telegram.org/bot*/sendMessage" in stored[5]
+    assert "postgresql://nexus:*@db.example:5432/nexus" in stored[3]
+
+
+def test_exceptions_store_type_and_message_only():
+    handler = _offline_handler(env=FAKE_SECRETS)
+    try:
+        raise ValueError(f"bad value {FAKE_SECRETS['HMAC_SECRET']}")
+    except ValueError:
+        record = _record("risk.kernel", f"{MARK} kernel check failed", level=logging.ERROR, exc_info=sys_module.exc_info())
+    logging.Formatter().format(record)  # another handler rendering the traceback first must not matter
+    assert record.exc_text and "Traceback" in record.exc_text
+
+    handler.handle(record)
+    (row,) = _drain(handler)
+    assert row[1:4] == ("Kernel", "risk.kernel", "ERROR")
+    assert row[4] == f"{MARK} kernel check failed | ValueError: bad value *"
+    assert "Traceback" not in row[4] and 'File "' not in row[4]
+
+
+def test_messages_are_capped_after_redaction():
+    handler = _offline_handler(env=FAKE_SECRETS)
+    secret = FAKE_SECRETS["ANTHROPIC_API_KEY"]
+    # The secret straddles the 2,000-character cap: none of it may survive.
+    text = "x" * (config.AGENT_LOG_MESSAGE_MAX - 10) + secret + "y" * 5000
+    handler.handle(_record("ai.analysis", text))
+    (row,) = _drain(handler)
+    assert len(row[4]) <= config.AGENT_LOG_MESSAGE_MAX
+    assert row[4].startswith("x" * 100)
+    assert secret[:6] not in row[4]
+
+
+def test_a_secret_cut_by_the_precut_cannot_slide_into_the_kept_text():
+    # Review finding: earlier redactions shorten the text, which used to pull a
+    # fragment of a secret cut at the pre-cut boundary into the stored part.
+    handler = _offline_handler(env=FAKE_SECRETS)
+    key = FAKE_SECRETS["ANTHROPIC_API_KEY"]
+    fred = FAKE_SECRETS["FRED_API_KEY"]
+    margin = max(handler.secret_max, backend._REDACTION_MARGIN)
+    head = (key + " ") * 40  # 40 redactions shrink the text by ~40 x len(key)
+    # Straddle the old pre-cut (message_max + longest secret) and the current one.
+    for boundary in (config.AGENT_LOG_MESSAGE_MAX + handler.secret_max, config.AGENT_LOG_MESSAGE_MAX + margin):
+        filler = "z" * (boundary - len(head) - 4)
+        text = head + filler + fred + "w" * 5000  # only fred's first 4 chars sit before the boundary
+        handler.handle(_record("sensors.fred", text))
+        (row,) = _drain(handler)
+        assert len(row[4]) <= config.AGENT_LOG_MESSAGE_MAX
+        for size in range(3, len(fred) + 1):
+            assert fred[:size] not in row[4], (boundary, size)
+        assert key[:6] not in row[4]
+
+
+def test_the_queue_is_reentrant_for_signal_handlers():
+    # Review finding: request_stop() logs from a signal handler; a non-reentrant
+    # queue lock held by the interrupted put() on the same thread would deadlock.
+    handler = _offline_handler()
+    assert isinstance(handler.queue, queue_module.SimpleQueue)
+
+
+def test_a_nul_character_does_not_sink_the_batch(agent_log_rows):
+    handler = backend.AgentLogHandler(database_url=config.DATABASE_URL, env={})
+    handler.handle(_record("sensors.news", f"{MARK} payload with a \x00 inside"))
+    handler.handle(_record("sensors.news", f"{MARK} its neighbour in the batch"))
+    try:
+        assert handler.flush_once() == 2
+    finally:
+        handler._drop_connection()
+    stored = [r[0] for r in database.fetch("SELECT message FROM agent_log WHERE message LIKE %s ORDER BY id", (f"{MARK}%",))]
+    assert stored == [f"{MARK} payload with a \\0 inside", f"{MARK} its neighbour in the batch"]
+
+
+def test_the_writer_connection_detects_a_dead_peer(monkeypatch):
+    seen = {}
+
+    def fake_connect(dsn, **kwargs):
+        seen.update(kwargs)
+        raise psycopg2.OperationalError("no server here")
+
+    monkeypatch.setattr(backend.psycopg2, "connect", fake_connect)
+    handler = _offline_handler()
+    handler.handle(_record("risk.stage", f"{MARK} stage read"))
+    assert handler.flush_once() == 0
+    assert seen["connect_timeout"] == config.AGENT_LOG_CONNECT_TIMEOUT_S
+    assert f"statement_timeout={config.AGENT_LOG_STATEMENT_TIMEOUT_MS}" in seen["options"]
+    assert seen["keepalives"] == 1 and seen["tcp_user_timeout"] > 0
+
+
+def test_drops_are_reported_on_stderr_once_per_change(capsys):
+    handler = _offline_handler(queue_max=1)
+    handler._report_drops()
+    assert capsys.readouterr().err == ""  # nothing dropped, nothing said
+    for i in range(4):
+        handler.handle(_record("sensors.basis", f"{MARK} {i}"))
+    handler._report_drops()
+    handler._report_drops()  # no change since the last report: silent
+    err = capsys.readouterr().err
+    assert err.count("3 dropped") == 1
+
+
+@pytest.mark.parametrize(
+    "name", ["psycopg2", "psycopg2.pool", "urllib3.connectionpool", "httpx", "httpx2", "httpcore.http11", "asyncio"]
+)
+def test_the_recursion_guard_drops_plumbing_loggers(name):
+    handler = _offline_handler()
+    handler.handle(_record(name, f"{MARK} transport chatter", level=logging.WARNING))
+    assert handler.queue.qsize() == 0
+
+
+def test_the_writer_thread_never_logs_itself():
+    handler = _offline_handler()
+    handler._writer_ident = threading.get_ident()  # as if this thread were the writer
+    handler.handle(_record("backend", f"{MARK} from the writer"))
+    assert handler.queue.qsize() == 0
+
+
+@pytest.mark.parametrize(
+    "logger_name, agent",
+    [
+        ("data.gold_agent", "Price feed"),
+        ("data.mt5_bridge", "Router"),
+        ("sensors.fred", "Macro (FRED)"),
+        ("sensors.positioning", "Positioning (COT)"),
+        ("sensors.calendar_agent", "Calendar"),
+        ("sensors.news", "News"),
+        ("sensors.basis", "Basis"),
+        ("fusion.state_vector", "State vector"),
+        ("fusion.regime", "Regime model"),
+        ("fusion.rag", "Memory"),
+        ("fusion.learning_loop", "Learning loop"),
+        ("ai.analysis", "Analyst"),
+        ("ai.price_resolver", "Analyst"),
+        ("ai.doctrine", "Doctrine"),
+        ("risk.validator", "Validator"),
+        ("risk.sizing", "Analyst"),
+        ("risk.kernel", "Kernel"),
+        ("risk.stage", "Stage"),
+        ("exec_.paper_engine", "Paper engine"),
+        ("exec_.router", "Router"),
+        ("exec_.position_engine", "Position engine"),
+        ("exec_.pod_agent", "Pods"),
+        ("pods.base", "Pods"),
+        ("pods.s1_fixfade", "Pods"),
+        ("pods.s4_newsburst", "Pods"),
+        ("pods.vwap", "Pods"),
+        ("ops.telegram_bot", "Telegram"),
+        ("backend", "Supervisor"),
+        ("link.channel", "Link"),
+        ("link.messages", "Link"),
+        ("core.state", "Other"),
+        ("ops.promotion", "Other"),
+        ("yfinance", "Other"),
+        ("backendish", "Other"),  # a prefix matches whole name segments only
+        ("podsx", "Other"),
+    ],
+)
+def test_each_real_logger_maps_to_its_agent(logger_name, agent):
+    assert backend.agent_for_logger(logger_name) == agent
+
+
+def test_every_agent_module_in_the_repo_has_a_named_agent():
+    from pathlib import Path as _Path
+
+    repo = _Path(backend.__file__).resolve().parent
+    deliberately_other = {"core.state", "ops.promotion", "scripts.run_one_cycle"}
+    unmapped = []
+    for path in sorted(repo.rglob("*.py")):
+        rel = path.relative_to(repo)
+        if rel.parts[0] in (".claude", "observatory", "tests") or "node_modules" in rel.parts:
+            continue
+        if "getLogger(__name__)" not in path.read_text(errors="ignore"):
+            continue
+        module = ".".join(rel.with_suffix("").parts)
+        if backend.agent_for_logger(module) == backend.AGENT_OTHER and module not in deliberately_other:
+            unmapped.append(module)
+    assert unmapped == []
+
+
+def test_main_attaches_the_handler_and_a_plain_supervisor_does_not(monkeypatch):
+    def handlers():
+        return [h for h in logging.getLogger().handlers if isinstance(h, backend.AgentLogHandler)]
+
+    assert handlers() == []
+    sup = make_supervisor([backend.Agent("sub", lambda: None, backend.KIND_SUBSCRIBER)])
+    sup.poll_once()
+    assert handlers() == []  # a Supervisor alone never touches logging
+
+    monkeypatch.setattr(backend.database, "init", lambda: None)
+    monkeypatch.setattr(backend.database, "run_migrations", lambda: [])
+    monkeypatch.setattr(backend, "AGENTS", [])
+    monkeypatch.setattr(backend.signal, "signal", lambda *a: None)
+    started = []
+    monkeypatch.setattr(backend.AgentLogHandler, "start_writer", lambda self: started.append(self))
+    seen_during_run = []
+    real_supervisor = backend.Supervisor
+
+    def capture(*args, **kwargs):
+        seen_during_run.extend(handlers())
+        supervisor = real_supervisor(*args, **kwargs)
+        supervisor.request_stop()
+        return supervisor
+
+    monkeypatch.setattr(backend, "Supervisor", capture)
+    assert backend.main() == 0
+    assert len(seen_during_run) == 1 and started == seen_during_run  # attached, writer started after boot
+    assert handlers() == []  # and detached on the way out
+
+
+def test_the_real_writer_thread_lands_rows_and_stops(agent_log_rows, real_writer):
+    handler = backend.AgentLogHandler(database_url=config.DATABASE_URL, env={}, flush_seconds=0.05)
+    handler.start_writer()
+    try:
+        handler.handle(_record("fusion.regime", f"{MARK} regime refused to train", level=logging.WARNING))
+        deadline = time_module.monotonic() + 5
+        rows = []
+        while time_module.monotonic() < deadline and not rows:
+            rows = database.fetch(
+                "SELECT agent, logger, level, thread FROM agent_log WHERE message = %s",
+                (f"{MARK} regime refused to train",),
+            )
+            if not rows:
+                time_module.sleep(0.05)
+        assert rows == [("Regime model", "fusion.regime", "WARNING", threading.current_thread().name)]
+    finally:
+        handler.close()
+    assert not handler._writer.is_alive()
+
+
+@requires_db
+def test_agent_log_pruning_deletes_only_rows_older_than_retention(ops_db):
+    now = datetime(2001, 1, 15, tzinfo=timezone.utc)
+    old = now - timedelta(days=config.AGENT_LOG_RETENTION_DAYS, hours=1)
+    kept = now - timedelta(days=config.AGENT_LOG_RETENTION_DAYS - 1)
+    ids = {}
+    with database.get_conn() as conn:
+        with conn.cursor() as cur:
+            for label, ts in (("old", old), ("kept", kept)):
+                cur.execute(
+                    "INSERT INTO agent_log (ts, agent, logger, level, message) VALUES (%s, 'Other', 'test', 'INFO', %s) RETURNING id",
+                    (ts, f"{MARK} prune {label}"),
+                )
+                ids[label] = cur.fetchone()[0]
+    try:
+        with database.get_conn() as conn:
+            with conn.cursor() as cur:
+                backend.prune_agent_log(cur, now)
+        remaining = {r[0] for r in database.fetch("SELECT id FROM agent_log WHERE id IN (%s, %s)", (ids["old"], ids["kept"]))}
+        assert remaining == {ids["kept"]}
+    finally:
+        database.execute("DELETE FROM agent_log WHERE id IN (%s, %s)", (ids["old"], ids["kept"]))
+
+
+@requires_db
+def test_agent_log_is_pruned_once_a_day_beside_the_heartbeats(ops_db, alerts, monkeypatch):
+    calls = []
+    monkeypatch.setattr(backend, "prune_agent_log", lambda cur, now: calls.append(now))
+    sup = make_supervisor([], ops_heartbeat=True)
+    row_ids = []
+    try:
+        first = datetime.now(timezone.utc)
+        row_ids.append(sup._ops_heartbeat({"alive": 0, "registered": 0, "dead": 0}, now=first))
+        row_ids.append(sup._ops_heartbeat({"alive": 0, "registered": 0, "dead": 0}, now=first + timedelta(seconds=30)))
+        assert calls == [first]  # once per UTC day, not every poll
+    finally:
+        for row_id in filter(None, row_ids):
+            database.execute("DELETE FROM ops_heartbeats WHERE id = %s", (row_id,))
+
+
+def test_the_routine_supervisor_heartbeat_line_is_not_stored_but_a_warning_is(agent_log_rows):
+    # The ruling: the periodic "heartbeat:" INFO line duplicates ops_heartbeats
+    # and is dropped; a heartbeat line at WARNING or above, and every other
+    # supervisor record, is kept.
+    handler = backend.AgentLogHandler(database_url=config.DATABASE_URL, env={})
+    routine = _record("backend", "heartbeat: alive=%d registered=%d dead=%d (of %d agents) %s", args=(10, 6, 0, 16, MARK))
+    warning = _record("backend", f"heartbeat: build_status_text failed {MARK}", level=logging.WARNING)
+    other = _record("backend", f"agent sub registered {MARK}")
+    try:
+        for record in (routine, warning, other):
+            handler.handle(record)
+        assert handler.routine_skipped == 1
+        assert handler.flush_once() == 2
+    finally:
+        handler._drop_connection()
+    try:
+        stored = database.fetch(
+            "SELECT agent, level, message FROM agent_log WHERE message LIKE %s ORDER BY id", (f"%{MARK}%",)
+        )
+        assert stored == [
+            ("Supervisor", "WARNING", f"heartbeat: build_status_text failed {MARK}"),
+            ("Supervisor", "INFO", f"agent sub registered {MARK}"),
+        ]
+    finally:
+        database.execute("DELETE FROM agent_log WHERE message LIKE %s", (f"%{MARK}%",))
